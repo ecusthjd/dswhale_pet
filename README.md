@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="preview_pet/eating.gif" width="400" alt="大肥鱼吃饭饭 — she sits on your desktop with a spoon and a bowl of rice">
-</p>
-
 <h1 align="center">Big Fat Fish Eats Rice<br><sub>大肥鱼吃饭饭</sub></h1>
 
 <p align="center">
