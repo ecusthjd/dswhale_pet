@@ -1,0 +1,8 @@
+# PyInstaller output -- the build intermediates and the packaged exe are rebuildable
+# (python tools\build_exe.py), and the one-file exe is ~43 MB, so neither belongs in git.
+build/
+dist/
+
+# Python bytecode caches
+__pycache__/
+*.py[cod]

@@ -1,0 +1,50 @@
+{
+  "ready": {
+    "label": "Ready to Eat",
+    "dir": "assets/pet/anim/ready",
+    "n": 7,
+    "w": 528,
+    "h": 560,
+    "fps": 11.0,
+    "bowl": [
+      0.2095,
+      0.8286
+    ]
+  },
+  "eating": {
+    "label": "Eating",
+    "dir": "assets/pet/anim/eating",
+    "n": 8,
+    "w": 528,
+    "h": 560,
+    "fps": 11.0,
+    "bowl": [
+      0.2038,
+      0.8464
+    ]
+  },
+  "fast": {
+    "label": "Eating Fast",
+    "dir": "assets/pet/anim/fast",
+    "n": 8,
+    "w": 528,
+    "h": 560,
+    "fps": 11.0,
+    "bowl": [
+      0.2093,
+      0.8329
+    ]
+  },
+  "empty": {
+    "label": "Out of Rice",
+    "dir": "assets/pet/anim/empty",
+    "n": 12,
+    "w": 528,
+    "h": 560,
+    "fps": 11.0,
+    "bowl": [
+      0.2004,
+      0.9055
+    ]
+  }
+}

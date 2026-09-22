@@ -1,0 +1,42 @@
+{
+  "ready": {
+    "file": "assets/pet/ready.png",
+    "label": "Ready to Eat",
+    "w": 640,
+    "h": 629,
+    "bowl": [
+      0.3254,
+      0.7533
+    ]
+  },
+  "eating": {
+    "file": "assets/pet/eating.png",
+    "label": "Eating",
+    "w": 640,
+    "h": 629,
+    "bowl": [
+      0.3254,
+      0.7512
+    ]
+  },
+  "fast": {
+    "file": "assets/pet/fast.png",
+    "label": "Eating Fast",
+    "w": 640,
+    "h": 629,
+    "bowl": [
+      0.3254,
+      0.74
+    ]
+  },
+  "empty": {
+    "file": "assets/pet/empty.png",
+    "label": "Out of Rice",
+    "w": 640,
+    "h": 629,
+    "bowl": [
+      0.3258,
+      0.7608
+    ]
+  }
+}
