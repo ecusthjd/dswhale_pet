@@ -52,6 +52,31 @@ app really reads, with the unused big Qt binaries stripped out), then lets PyIns
 it — the exe drops from 62.5 MB to about 35 MB. All the assets it needs live in `assets/`, so just
 run it; if something is missing it names the file instead of failing silently.
 
+## Releasing the exe on GitHub
+
+`dist/` is not in git (`.gitignore`), so the exe is published as a **release asset**, not as a commit:
+build it, tag the commit you built from, then attach the exe to the release for that tag.
+
+```powershell
+python tools\build_exe.py                  # -> dist\dswhale_pet.exe
+git tag -a v1.1.0 -m "dswhale_pet v1.1.0"  # a new tag; a tag can only be used once
+git push origin v1.1.0
+```
+
+Then either:
+
+* **Web UI** (no extra tools): repository → *Releases* → **Draft a new release** → *Choose a tag* →
+  `v1.1.0` → write the title and notes → drag `dist\dswhale_pet.exe` into the *Attach binaries* box →
+  **Publish release**.
+* **GitHub CLI** (one command, after `winget install GitHub.cli` and `gh auth login`):
+
+  ```powershell
+  gh release create v1.1.0 dist\dswhale_pet.exe --title "dswhale_pet v1.1.0" --notes "What changed in this build."
+  ```
+
+A release asset may be up to 2 GB, while a file committed to git wants to stay under 100 MB — which is
+exactly why the ~43 MB one-file exe belongs on the release page and not in the repository.
+
 ## What is in this folder
 
 ```
