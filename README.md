@@ -1,23 +1,42 @@
-# Big Fat Fish Eats Rice
+<p align="center">
+  <img src="preview_pet/eating.gif" width="400" alt="大肥鱼吃饭饭 — she sits on your desktop with a spoon and a bowl of rice">
+</p>
 
-> 大肥鱼吃饭饭
+<h1 align="center">Big Fat Fish Eats Rice<br><sub>大肥鱼吃饭饭</sub></h1>
 
-A desktop pet that polls the DeepSeek balance API and switches between four states based on
-**how fast the money is burning**. It lives in a frameless, transparent, always-on-top window:
-she sits on your desktop eating rice, and you get a right-click menu, drag-to-move and a status
-bubble. All four states are **frame-by-frame animations**.
+<p align="center">
+  A desktop pet that <b>polls the DeepSeek balance API</b> and eats rice exactly as fast as your
+  money burns.<br>
+  She lives in a frameless, transparent, always-on-top window: four states, every one of them a
+  frame-by-frame animation, and a right-click menu, drag-to-move and a status bubble to go with it.
+</p>
 
-![Ready to Eat](preview_pet/ready.gif)
-![Eating](preview_pet/eating.gif)
-![Eating Fast](preview_pet/fast.gif)
-![Out of Rice](preview_pet/empty.gif)
+<p align="center">
+  <a href="https://github.com/ecusthjd/dswhale_pet/releases/download/v1.0.0/dswhale_pet.exe">
+    <b>⬇ Download dswhale_pet.exe</b>
+  </a><br>
+  <sub>43 MB, one file, no Python and nothing to install — double-click it and she is on your
+  desktop. Newer builds live on the <a href="https://github.com/ecusthjd/dswhale_pet/releases">releases page</a>.</sub>
+</p>
 
-| State | When it shows up |
-| --- | --- |
-| 🍚 Ready to Eat | balance > 0, but it has not dropped for a while |
-| 🥄 Eating | money is burning, rate ≤ threshold (2 CNY/hour by default) |
-| 🔥 Eating Fast | rate > threshold |
-| 💸 Out of Rice | balance < 0.01 CNY, or the API says `is_available:false` |
+<p align="center">
+  <img alt="Windows 10 / 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white">
+  <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white">
+  <img alt="PyQt5" src="https://img.shields.io/badge/GUI-PyQt5-41CD52?logo=qt&logoColor=white">
+  <img alt="the API key never leaves your machine" src="https://img.shields.io/badge/API%20key-stays%20on%20your%20machine-critical">
+</p>
+
+No DeepSeek key at hand? The app has a **demo mode** (`--demo cycle` on the command line, or the
+settings dialog): all four states and their animations are right there, no account needed.
+
+## The four states
+
+| 🍚 Ready to Eat | 🥄 Eating | 🔥 Eating Fast | 💸 Out of Rice |
+|:---:|:---:|:---:|:---:|
+| <img src="preview_pet/ready.gif" width="260" alt="Ready to Eat"> | <img src="preview_pet/eating.gif" width="260" alt="Eating"> | <img src="preview_pet/fast.gif" width="260" alt="Eating Fast"> | <img src="preview_pet/empty.gif" width="260" alt="Out of Rice"> |
+| balance > 0, but it has not dropped for a while | money is burning, rate ≤ threshold (2 CNY/hour by default) | rate > threshold | balance < 0.01 CNY, or the API says `is_available:false` |
+
+## She talks back
 
 Every state change comes with one spoken line, and **the line depends on where she came from and
 where she is going** (entering "Eating": just picked up the spoon / slowed back down / eating
@@ -28,6 +47,7 @@ the fast state, so none of them ever mentions chopsticks.
 ## Running it
 
 ```powershell
+dswhale_pet.exe                  # the downloaded build: nothing to install, no console window
 python -m pip install PyQt5      # the only dependency
 python dswhale_pet.py            # run it in a terminal (so you can see errors)
 run_pet.bat                      # double-click (uses pythonw, no console window)
@@ -89,15 +109,17 @@ assets/pet/pet_meta.json   metadata for the four states (bowl rim position and f
 assets/pet/anim/           four frame-by-frame animations: <state>/000.png… + meta.json
                            (35 frames, 11.5 MB)
 assets/dswhale_pet.ico     exe / window icon
-preview_pet/*.gif          the four preview animations (the ones shown above)
-preview_pet/gif/           anti-jitter versions: <state>_plain.gif (transparent) and
-                           <state>_table.gif (a generated table added)
+preview_pet/*.gif          the four preview animations shown above (ready / eating / fast / empty,
+                           2 MB in total; eating is the banner, 400 px wide)
+tools/make_preview_gifs.py rebuilds those GIFs from assets/pet/anim -- scaled down, one shared
+                           palette, no dithering; --plain also writes transparent copies
 ```
 
 > This folder **runs and builds on its own**: every asset the app reads ships inside `assets/`.
-> What is *not* here is the asset pipeline and the acceptance suite (cutting the frames out,
-> writing the animations, making the GIFs, building the icon, all those verification scripts),
-> and neither are the four static fallback portraits in `assets/pet/*.png` — they are never used
-> once the frame-by-frame assets exist.
+> What is *not* here is the asset pipeline and the acceptance suite (cutting the frames out of the
+> source art, writing the animations, building the icon, all those verification scripts), and
+> neither are the four static fallback portraits in `assets/pet/*.png` — they are never used once
+> the frame-by-frame assets exist. The README's GIFs *are* rebuildable from here:
+> `python tools\make_preview_gifs.py`.
 > The character art and the animation frames are AI-generated; check the terms of the service you
 > generated them with before redistributing them.
