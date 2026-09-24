@@ -5,9 +5,9 @@
 # the window. assets/layers (intermediate cut-outs), the static portraits, the exported jpg
 # files and the source SVG stay out of the package.
 DATAS = [
-    ('H:/temp/dswhale_pet/assets/pet/pet_meta.json', 'assets/pet'),
-    ('H:/temp/dswhale_pet/assets/pet/anim', 'assets/pet/anim'),
-    ('H:/temp/dswhale_pet/assets/dswhale_pet.ico', 'assets'),
+    ('D:/temp/dswhale_eatfreerice/github/assets/pet/pet_meta.json', 'assets/pet'),
+    ('D:/temp/dswhale_eatfreerice/github/assets/pet/anim', 'assets/pet/anim'),
+    ('D:/temp/dswhale_eatfreerice/github/assets/dswhale_pet.ico', 'assets'),
 ]
 
 # PyQt5 modules the pet never uses (it only needs QtCore / QtGui / QtWidgets)
@@ -33,7 +33,7 @@ DROP_BINARIES = [
 ]
 
 a = Analysis(
-    ['H:/temp/dswhale_pet/dswhale_pet.py'],
+    ['D:/temp/dswhale_eatfreerice/github/dswhale_pet.py'],
     pathex=[],
     binaries=[],
     datas=DATAS,
@@ -52,7 +52,7 @@ pyz = PYZ(a.pure)
 COMMON = dict(debug=False, bootloader_ignore_signals=False, strip=False, upx=True,
               upx_exclude=[], runtime_tmpdir=None, console=False,
               disable_windowed_traceback=False, argv_emulation=False, target_arch=None,
-              codesign_identity=None, entitlements_file=None, icon=['H:/temp/dswhale_pet/assets/dswhale_pet.ico'])
+              codesign_identity=None, entitlements_file=None, icon=['D:/temp/dswhale_eatfreerice/github/assets/dswhale_pet.ico'])
 
 # one-file build: unpacks to %TEMP% on every start
 exe = EXE(pyz, a.scripts, a.binaries, a.datas, [],

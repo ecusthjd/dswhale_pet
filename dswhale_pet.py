@@ -2,13 +2,23 @@
 """Big Fat Fish Eats Rice -- desktop pet (PyQt5)
 
 A frameless, transparent, always-on-top little window: she sits at a little table eating rice, and
-**how fast she eats is driven by how fast you really burn money** (measured by polling the DeepSeek
-balance API).
+**how fast she eats is driven by how fast you really burn through data** -- which feed she watches
+can be switched from the right-click menu ("Monitor (mode)"):
 
-    ready  balance asleep            frames in assets/pet/anim/ready/
-    eating burning at a normal rate  frames in assets/pet/anim/eating/
-    fast   burning fast              frames in assets/pet/anim/fast/
-    empty  balance 0 / API says no   frames in assets/pet/anim/empty/
+    DeepSeek balance  how fast the balance drops (CNY/h); balance at zero = out of rice
+    OpenCode Go       how fast the rolling window's remaining percent drops (%/h) -- in other
+                      words how fast the rolling value rises; spending faster than the threshold
+                      (default 20%/h) puts her in "Eating Fast"; any of rolling / weekly / monthly
+                      **at 100%** = out of rice
+
+    ready  not eating                  frames in assets/pet/anim/ready/
+    eating eating at a normal rate     frames in assets/pet/anim/eating/
+    fast   eating fast                 frames in assets/pet/anim/fast/
+    empty  balance 0 / window full / API says no   frames in assets/pet/anim/empty/
+
+In Go mode the rolling window's used percent is folded into a **remaining percent** (only ever goes
+down -- the same direction as the balance), so rate measuring, the four states, the curve, the
+speed gauge and "how long will it last" all reuse the same code; only the unit goes from CNY to %.
 
 All four states are **frame-by-frame animations**: AI animation frames cut out into transparent PNGs
 (assets/pet/anim/) and looped here at their fps. Without frame art the app falls back to the static
@@ -22,20 +32,23 @@ Run it::
     python dswhale_pet.py --demo cycle     # no API key needed, just look at her
     python dswhale_pet.py --key sk-xxx     # key on the command line (usually: right-click -> Settings)
     python dswhale_pet.py --state fast     # force one state (debugging / screenshots)
+    python dswhale_pet.py --go-usage --go-key oc_sk-xxx   # one-shot Go usage check, then exit (no window)
 
 Command line arguments are in parse_args below; the README has the algorithm and parameter details.
 
-Depends on PyQt5 only: the balance API goes through urllib and the portraits are pre-made transparent
-PNGs, so there is no requests / Pillow. Rate measuring and the four-state logic live in Core, which
-**contains no Qt at all** and can be run on its own.
+Depends on PyQt5 only: both endpoints (balance / Go usage) go through urllib, and the portraits are
+pre-made transparent PNGs, so there is no requests / Pillow. Rate measuring and the four-state logic
+live in Core, which **contains no Qt at all** and can be run on its own.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -48,7 +61,7 @@ from PyQt5.QtGui import (QBrush, QColor, QCursor, QFont, QFontMetrics, QIcon, QI
 from PyQt5.QtWidgets import (QActionGroup, QApplication, QCheckBox, QComboBox,
                              QDialog, QDoubleSpinBox, QFormLayout, QHBoxLayout,
                              QLabel, QLineEdit, QMenu, QMessageBox,
-                             QPlainTextEdit, QPushButton, QSlider, QSpinBox,
+                             QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox,
                              QSystemTrayIcon, QVBoxLayout, QWidget)
 
 APP = 'dswhale_pet'
@@ -61,11 +74,48 @@ META_PATH = os.path.join(PET_DIR, 'pet_meta.json')
 ANIM_META = os.path.join(PET_DIR, 'anim', 'meta.json')     # frame table, made by the asset pipeline
 ICON_PATH = os.path.join(ROOT, 'assets', 'dswhale_pet.ico')  # window icon (made by the asset pipeline)
 API = 'https://api.deepseek.com/user/balance'
+# OpenCode Go (a $10/month subscription) usage: read-only percentages, no request counts, nothing is
+# ever modified. Three windows -- rolling / weekly / monthly -- each carrying its own reset time.
+GO_API = 'https://opencode.ai/zen/go/v1/usage'
+GO_WINS = ('rolling', 'weekly', 'monthly')
+GO_LABEL = {'rolling': 'Rolling', 'weekly': 'Weekly', 'monthly': 'Monthly'}
+GO_WIN_COLOR = (0.50, 0.80)                          # usage bar: <50% green, <80% yellow, above red
+GO_FULL = 100.0                                      # a window is full at 100% (any one = out of quota)
+GO_RESET_EPS = 5.0                                   # remaining % jumped this much -> window loosened, start over
+
+# Two modes: which data decides "how fast she eats". The two keys belong to two different services,
+# she never uses both.
+#   deepseek  how fast the DeepSeek balance (CNY) drops;
+#   go        how fast the **rolling window's remaining percent** drops (= how fast the rolling
+#             value rises); any window full (100%) = "out of rice".
+# Folding it into a "remaining %" keeps it in the same direction as the balance: it only drops, and
+# the faster it drops the faster she eats -- rate measuring, the four states, the curve, the speed
+# gauge and "how long will it last" all work unchanged, the unit just goes from CNY to %.
+MODES = {
+    'deepseek': {'name': 'DeepSeek', 'label': 'DeepSeek balance (CNY/h)',
+                 'unit': 'CNY', 'rate': 'CNY/hour', 'thresh': 'slowMax'},
+    'go':       {'name': 'OpenCode Go', 'label': 'OpenCode Go usage (%/h)',
+                 'unit': '%', 'rate': '%/hour', 'thresh': 'goSlowMax'},
+}
+MODE_KEYS = ('deepseek', 'go')
+
+# Go-mode talk: the "money" phrases turn into "quota" phrases ('CNY/hour' -> '%/hour',
+# "Balance hit zero" -> "quota used up" ...). The mode changed, so the spoken lines change too.
+GO_TALK_SWAP = (('CNY/hour', '%/hour'), ('Balance hit zero', 'Quota used up'),
+                ('balance', 'quota'), ('Food again', 'Quota back'),
+                ('Bowl is full again', 'Quota back'), ('burning money', 'spending quota'))
 
 # Defaults for the config (the key names are the field names in the config file)
 CFG_DEFAULT = {
     'key': '', 'pollSec': 10, 'idleSec': 120, 'slowMax': 2.0, 'price': 4.0,
     'windowMin': 15,
+    # which feed she eats off (deepseek / go, see MODES above); goSlowMax is the Go-mode
+    # "fast eating" threshold
+    'mode': 'deepseek', 'goSlowMax': 20.0,
+    # OpenCode Go: goKey is a second key (opencode.ai's), unrelated to the DeepSeek one; goSec only
+    # governs the "also peek at usage" cadence in DeepSeek mode (in Go mode the usage IS the main
+    # data, so it follows pollSec instead)
+    'goKey': '', 'goSec': 60, 'goBubble': True,
     # which rate drives the animation: 'burst' = instant (responsive, default) / 'fit' = fitted
     # (steady, half a beat late)
     'actOn': 'burst',
@@ -202,6 +252,12 @@ def ago(ms_) -> str:
     return '%dh' % (s // 3600)
 
 
+def ago_text(at, now=None) -> str:
+    """The "updated N ago" line (a fresh one must not read "just now ago")."""
+    txt = ago((now or now_ms()) - at)
+    return txt + ('' if txt == 'just now' else ' ago')
+
+
 def num(v, d=0.0) -> float:
     try:
         x = float(v)
@@ -251,6 +307,11 @@ class Core:
         self.rateAt = 0
         self.events = []              # balance changes not drawn yet (see take_events)
         self.msg_seen = {}            # line rotation: which line each pair is at (a counter, no RNG)
+        self.go = {}                  # OpenCode Go usage: {window: {'percent', 'status', 'resetAt'}}
+        self.goRaw = None             # the last raw response (shown in the dialog)
+        self.goAt = 0                 # when the Go usage was last fetched successfully
+        self.goErr = ''               # the Go fetch error (kept separate from the balance errMsg)
+        self.goFull = False           # Go mode: some window is full (100%) = out of quota
 
     # ---------- balance change events (feed the floating labels in the render layer) ----------
     def add_event(self, kind, amount, t):
@@ -330,9 +391,13 @@ class Core:
             if abs(den) > 1e-12:
                 slope = max(0.0, -(n * sxy - sx * sy) / den)
         # Instant segment: compare the balance with the sample from max(idle window, 3x poll) ago,
-        # so a single 0.01 step cannot blow up into tens of CNY/hour
+        # so a single 0.01 step cannot blow up into tens of CNY/hour.
+        # The Go feed only moves in **1% steps**, so over a short span the difference is all whole
+        # steps (1 step / 2 min = 30%/hour); in Go mode give the span at least one full window.
         burst = 0.0
         span = max(self.cfg['idleSec'] * 1000, self.cfg['pollSec'] * 3000)
+        if self.go_mode():
+            span = max(span, self.win_ms())
         anchor = self.find(t - span)
         if (anchor is not None and self.curBal is not None
                 and anchor[1] > self.curBal + 1e-9 and t - anchor[0] > 3000):
@@ -359,21 +424,40 @@ class Core:
         return self.burst if self.cfg.get('actOn') == 'burst' else self.rate
 
     def decide(self, t):
+        """Which state it should be right now.
+
+        DeepSeek mode: the balance only goes down (top-ups aside), so balance at zero / the API
+        saying "unavailable" = out of rice.
+        Go mode: the rolling window's "remaining %" only goes down too (spending), so the rules are
+        identical -- with exactly one difference: **any window full (100%) = out of rice**.
+        """
         if self.forced:
             return self.forced
         if self.curBal is None:
             return 'ready'
-        if self.isAvailable is False:
-            return 'empty'
-        if self.curBal < 0.01:
-            return 'empty'
+        if self.go_mode():
+            if self.goFull or self.curBal <= 0.5:
+                return 'empty'
+        else:
+            if self.isAvailable is False:
+                return 'empty'
+            if self.curBal < 0.01:
+                return 'empty'
         look = self.cfg['idleSec'] * 3000            # slow burning gets 3x the grace
+        grace, eps = self.cfg['idleSec'] * 1000, 0.01
+        if self.go_mode():
+            # Go's data only moves in 1% steps: even normal spending can skip a few minutes
+            # between ticks, so the "is she still eating" time scale goes up to a whole window
+            # and the movement threshold to "at least half a step".
+            look = max(look, self.win_ms())
+            grace = max(grace, self.win_ms())
+            eps = 0.5
         an = self.find(t - look)
-        active = ((t - self.lastDropAt) < self.cfg['idleSec'] * 1000
-                  or (an is not None and an[1] - self.curBal >= 0.01))
+        active = ((t - self.lastDropAt) < grace
+                  or (an is not None and an[1] - self.curBal >= eps))
         if not active:
             return 'ready'
-        lim = self.cfg['slowMax']
+        lim = self.thresh()
         r = self.act_speed()                         # instant or fitted, per settings
         if self.state == 'fast':                     # already fast: only fall back below 0.85x
             return 'fast' if r > lim * 0.85 else 'eating'
@@ -390,8 +474,18 @@ class Core:
         return True
 
     def _fill_talk(self, text):
-        """Fill `{rate}` / `{bal}` in a spoken line (CNY/hour, balance with its currency)."""
+        """Fill `{rate}` / `{bal}` in a spoken line (CNY/hour, balance with its currency).
+
+        In Go mode GO_TALK_SWAP runs afterwards: CNY/hour -> %/hour, "money" talk -> "quota" talk.
+        The mode changed, so the spoken lines must change too, or the bubble would read %/hour
+        while the line still talks about "balance hit zero".
+        """
         bal = self.curBal if self.curBal is not None else 0.0
+        if self.go_mode():
+            txt = text.replace('{rate}', fmt(self.rate, 1)).replace('{bal}', fmt(bal, 0) + '%')
+            for a, b in GO_TALK_SWAP:
+                txt = txt.replace(a, b)
+            return txt
         return (text.replace('{rate}', fmt(self.rate, 1))
                     .replace('{bal}', cur_sym(self.cur) + fmt(bal)))
 
@@ -424,10 +518,10 @@ class Core:
         r = self.rate
         if r <= 0:
             return 1.0
-        return clamp(1 + math.log10(1 + r / max(self.cfg['slowMax'], 0.05)) * 2.2, 1.0, 3.4)
+        return clamp(1 + math.log10(1 + r / max(self.thresh(), 0.05)) * 2.2, 1.0, 3.4)
 
     def gauge_frac(self):
-        top = max(self.cfg['slowMax'] * 4, 0.5)
+        top = max(self.thresh() * 4, 0.5)
         return clamp(math.log10(1 + max(self.rate, 0.0)) / math.log10(1 + top), 0.0, 1.0)
 
     # ---------- taking data in ----------
@@ -468,6 +562,126 @@ class Core:
     def set_error(self, msg):
         self.errMsg = str(msg)
         self.failCount += 1
+
+    # ---------- OpenCode Go usage (subscription quota; its own thing, not the balance) ----------
+    def set_go_usage(self, js, t):
+        """Store one Go usage response: parse it and remember the raw one. A wrong shape raises,
+        and the UI prints a human-readable message either way."""
+        self.go = parse_go_usage(js)
+        self.goRaw = js
+        self.goAt = t
+        self.goErr = ''
+        return self.go
+
+    def set_go_error(self, msg):
+        """A Go fetch failed: only record the error, keep the previous data ("showing what was
+        seen last" beats an empty space)."""
+        self.goErr = str(msg)
+
+    def go_binding(self):
+        """Which line she is stuck on when out of quota -> (window key, reset time); None when no
+        time was given.
+
+        More than one window can be full at once (rolling + weekly together is common), and then
+        the **latest** reset is the real bottleneck; if none is full but the rolling one ran dry,
+        use its reset time. With no window data at all (nothing fetched yet) -> (None, None).
+        """
+        if not self.go_mode() or not self.go:
+            return None, None
+        full = [w for w in GO_WINS
+                if w in self.go and self.go[w]['percent'] >= GO_FULL]
+        if full:
+            known = [w for w in full if self.go[w]['resetAt']]
+            if known:
+                w = max(known, key=lambda k: self.go[k]['resetAt'])
+                return w, self.go[w]['resetAt']
+            return full[0], None
+        roll = self.go.get('rolling')
+        return ('rolling', roll['resetAt']) if roll else (None, None)
+
+    def go_empty(self):
+        """Does Go mode count as "out of quota" right now (the same condition decide() uses)."""
+        return (self.go_mode() and self.curBal is not None
+                and (self.goFull or self.curBal <= 0.5))
+
+    def go_clock(self, now=None):
+        """The countdown string above her head: **only `HH:MM:SS`** (no reset time given ->
+        `--:--:--`; nothing else is ever added).
+
+        The render layer recomputes it every frame (with the current millisecond), so the seconds
+        really tick; it only has a value while she is out of quota, otherwise None (i.e. hidden).
+        """
+        if not self.go_empty():
+            return None
+        _win, at = self.go_binding()
+        if not at:
+            return '--:--:--'
+        return hms(max(0, at - (now or now_ms())))
+
+    def add_go_usage(self, js, t):
+        """**The Go-mode main data**: fold the "rolling window used percent" into a "remaining
+        percent" and feed that to the rate-measuring machinery.
+
+        Why fold it to remaining: it keeps the same direction as the balance -- only decreases as
+        she eats, so "how fast the rolling value rises" equals "how fast the remainder drops", and
+        the slope / instant / four states / curve / "how long will it last" all work as-is.
+
+        Three things happen here:
+        * any window full (>=100%) sets `goFull`, so decide() parks her on "out of rice";
+        * the remaining % jumps **way up** from the last tick (old requests slid out of the
+          window / the window reset) -- the old consumption no longer counts, clear the samples
+          and start over, and return a line for the UI to toast (same channel as a top-up);
+        * otherwise it behaves exactly like a balance tick: record a sample, measure the rate,
+          decide the state.
+        """
+        usage = parse_go_usage(js)
+        self.go = usage
+        self.goRaw = js
+        self.goAt = t
+        self.goErr = ''
+        self.goFull = any(info['percent'] >= GO_FULL for info in usage.values())
+        info = usage.get('rolling')
+        if info is None:
+            # the rolling value is Go mode's main signal: without it "how fast it rises" cannot be
+            # measured -- do not pretend it can
+            raise ValueError('no rolling window in the response (Go mode needs it for the rate)')
+        rem = max(0.0, GO_FULL - float(info['percent']))
+        msg = ''
+        if self.curBal is not None and rem > self.curBal + GO_RESET_EPS:
+            self.samples = []
+            self.lastDropAt = 0
+            self.bal0 = rem
+            msg = '🔄 Rolling window loosened: old requests slid out / the window reset, starting over'
+        self.curBal = rem
+        self.cur = 'CNY'
+        self.isAvailable = True
+        self.lastOkAt = t
+        self.errMsg = ''
+        self.failCount = 0
+        self.push_sample(rem, t)
+        self.speed_now(t)
+        self.apply_state(t)
+        return msg
+
+    def go_worst(self):
+        """The window being used the most (key, info) -- the tray tooltip and the bubble line pick
+        it as the representative."""
+        if not self.go:
+            return None, None
+        k = max(GO_WINS, key=lambda w: self.go[w]['percent'] if w in self.go else -1.0)
+        return k, self.go.get(k)
+
+    def go_pct_text(self):
+        """A short line like "Monthly 35%"; empty while there is no data yet."""
+        k, info = self.go_worst()
+        if k is None or info is None:
+            return ''
+        return '%s %s%%' % (GO_LABEL[k], go_pct_str(info['percent']))
+
+    def go_tip(self):
+        """The tray tooltip snippet: '  Go Monthly 35%' (nothing while there is no data)."""
+        txt = self.go_pct_text()
+        return ('  Go ' + txt) if txt else ''
 
     # ---------- demo mode (fakes the data locally, no API key needed) ----------
     def demo_start(self, name, t, bal=None):
@@ -523,10 +737,10 @@ class Core:
         if not self.demo_on():
             return ''
         d = DEMOS[self.demo]
-        r = self.demo_mult(t) * self.cfg['slowMax']
+        r = self.demo_mult(t) * self.thresh()        # the threshold follows the mode (CNY/h or %/h)
         self.demoBalF = max(0.0, self.demoBalF - r * (dt_s / 3600.0)
                             * (0.7 + random.random() * 0.6))
-        if d.get('drain') and self.demoBalF < 0.01:
+        if d.get('drain') and self.demoBalF < (0.5 if self.go_mode() else 0.01):
             self.demoBalF = 0.0
         msg = ''
         if d.get('cycle') and self.demoBalF <= 0.02:
@@ -563,6 +777,155 @@ class Core:
 
     def sign(self):
         return '$' if self.cur == 'USD' else '¥'
+
+    # ---------- mode: watch the balance or the Go usage ----------
+    def mode(self):
+        m = self.cfg.get('mode') or 'deepseek'
+        return m if m in MODES else 'deepseek'
+
+    def go_mode(self):
+        return self.mode() == 'go'
+
+    def thresh(self):
+        """The current mode's "fast eating" threshold: DeepSeek in CNY/hour, Go in %/hour."""
+        key = MODES[self.mode()]['thresh']
+        v = num(self.cfg.get(key), None)
+        if v is None or v <= 0:
+            v = CFG_DEFAULT[key]
+        return float(v)
+
+    def unit(self):
+        return MODES[self.mode()]['unit']
+
+    def rate_unit(self):
+        return MODES[self.mode()]['rate']
+
+    def lab(self, v=None, pre='Left '):
+        """A quantity with its unit: `¥88.50` (DeepSeek) / `Left 65%` (Go). The bowl label and the
+        bubble's big number both use it."""
+        v = self.curBal if v is None else v
+        if self.go_mode():
+            return (pre + '--%') if v is None else ('%s%s%%' % (pre, fmt(v, 0)))
+        return self.sign() + (' --.--' if v is None else fmt(v, 2))
+
+    def float_style(self):
+        """How the floating labels carry their unit: money carries the currency sign (−¥0.03),
+        Go carries % with fewer decimals (−1.0%)."""
+        if self.go_mode():
+            return {'sym': '', 'unit': '%', 'dec': 1}
+        return {'sym': self.sign(), 'unit': '', 'dec': 2}
+
+    def err_text(self):
+        """The error for the current mode's feed (the bubble's "connection failed" line and the
+        ⚠ line both use it)."""
+        return self.goErr if self.go_mode() else self.errMsg
+
+    def tip_val(self):
+        """The number in the tray tooltip: `  ¥88.50` / `  Left 65%` (nothing while there is no
+        data)."""
+        return '' if self.curBal is None else ('  ' + self.lab())
+
+
+def iso_ms(s):
+    """ISO 8601 -> a millisecond timestamp (the API gives UTC, e.g. 2026-08-17T00:00:00.569Z).
+
+    Understands a trailing Z, an explicit offset and fractional seconds; anything unrecognised
+    returns None -- the reset time is only there to display "how long is left", and losing it
+    should never break the pet.
+    """
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t, off = s.strip(), 0
+    m = re.search(r'([+-])(\d{2}):?(\d{2})$', t)
+    if m:
+        off = (1 if m.group(1) == '+' else -1) * (int(m.group(2)) * 3600 + int(m.group(3)) * 60)
+        t = t[:m.start()]
+    t = t.replace('Z', ' ').replace('T', ' ').split('.')[0].strip()
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+        try:
+            dt = datetime.datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+        return int((dt - datetime.datetime(1970, 1, 1)).total_seconds() - off) * 1000
+    return None
+
+
+def go_pct(info):
+    """The window's "used percent" (35 from the API is 35% used). A string with a % is fine too."""
+    if not isinstance(info, dict):
+        return None
+    v = info.get('percent')
+    if isinstance(v, str):
+        v = v.strip().rstrip('%').strip()
+    return num(v, None)
+
+
+def go_pct_str(p) -> str:
+    """A percent as text: whole numbers get no decimal point (35% / 12% / 0.5%)."""
+    return ('%.1f' % p) if abs(p - round(p)) > 0.05 else ('%.0f' % p)
+
+
+def go_ok(info) -> bool:
+    """Is this window's status fine: the API says ok; anything else is printed as-is, not ignored."""
+    st = str((info or {}).get('status') or '').strip().lower()
+    return st in ('', 'ok')
+
+
+def dhmm(ms_) -> str:
+    """A duration as a short phrase: 12d4h / 5h12m / 40s (days only once there is a whole day)."""
+    s = max(0, int(ms_ // 1000))
+    if s >= 86400:
+        return '%dd %dh' % (s // 86400, (s % 86400) // 3600)
+    return hhmm(s * 1000)
+
+
+def hms(ms_) -> str:
+    """A duration as `HH:MM:SS` (hours never roll over into days: a weekly window with 3 days left
+    is `72:00:00`).
+
+    The "countdown to refill" badge above her head uses it: second by second, far more precise than
+    a coarse "3 days 4 hours" (the renderer recomputes it every frame, so it really ticks rather
+    than jumping once a minute).
+    """
+    s = max(0, int(ms_ // 1000))
+    return '%02d:%02d:%02d' % (s // 3600, (s % 3600) // 60, s % 60)
+
+
+def go_reset_text(info, now=None) -> str:
+    """How long until the reset (said plainly when no reset time was given, or it already passed)."""
+    at = (info or {}).get('resetAt')
+    if not at:
+        return ''
+    left = at - (now or now_ms())
+    return 'waiting for the reset' if left <= 0 else ('resets in ' + dhmm(left))
+
+
+def parse_go_usage(js):
+    """Break an OpenCode Go response into {window: {'percent', 'status', 'resetAt'}}.
+
+    Only the three GO_WINS windows are picked: a future extra window cannot break anything, and a
+    missing window is not an error either (the ones that are there still show). But "no usage at
+    all" and "can't read percent" MUST be reported -- showing a wrong number is worse than showing
+    nothing.
+    """
+    usage = js.get('usage') if isinstance(js, dict) else None
+    if not isinstance(usage, dict):
+        raise ValueError('the response has no usage field')
+    out = {}
+    for k in GO_WINS:
+        info = usage.get(k)
+        if info is None:
+            continue
+        if not isinstance(info, dict):
+            raise ValueError('usage.%s is not an object' % k)
+        pct = go_pct(info)
+        if pct is None:
+            raise ValueError('cannot read the percent of usage.%s' % k)
+        out[k] = {'percent': max(0.0, pct), 'status': str(info.get('status') or ''),
+                  'resetAt': iso_ms(info.get('resetsAt'))}
+    if not out:
+        raise ValueError('none of the three usage windows are present')
+    return out
 
 
 # =====================================================================
@@ -608,6 +971,23 @@ def save_config(cfg, path=None):
         return None
 
 
+def http_error_text(code, raw):
+    """An HTTP error as one readable line: prefers the message the API put in its own JSON.
+
+    Both DeepSeek and opencode.ai answer with `{"error": {"message": ...}}`, so the wording is
+    settled in one place and shared by both fetch paths (a 401 looks like "HTTP 401: Unauthorized").
+    """
+    msg = (raw or '')[:140]
+    try:
+        js = json.loads(raw)
+        err = js.get('error') if isinstance(js, dict) else None
+        if isinstance(err, dict) and err.get('message'):
+            msg = str(err['message'])
+    except Exception:
+        pass
+    return 'HTTP %d: %s' % (code, msg or '')
+
+
 def fetch_balance(key, timeout=10):
     """GET the balance endpoint. On failure the original error text is handed to the user (both the
     bubble and the message bar print it)."""
@@ -625,13 +1005,7 @@ def fetch_balance(key, timeout=10):
             raw = e.read().decode('utf-8', 'replace')
         except Exception:
             pass
-        msg = raw[:140]
-        try:
-            js = json.loads(raw)
-            msg = (js.get('error') or {}).get('message') or msg
-        except Exception:
-            pass
-        raise RuntimeError('HTTP %d: %s' % (e.code, msg or ''))
+        raise RuntimeError(http_error_text(e.code, raw))
     except urllib.error.URLError as e:
         raise RuntimeError('request could not be sent: %s' % e.reason)
     except Exception as e:
@@ -642,6 +1016,47 @@ def fetch_balance(key, timeout=10):
         raise RuntimeError('cannot make sense of the response: ' + raw[:140])
     if not isinstance(js, dict):
         raise RuntimeError('the response is not a JSON object: ' + raw[:140])
+    return js
+
+
+def fetch_go_usage(key, timeout=10):
+    """GET the OpenCode Go usage endpoint (**read-only**: spends no quota, changes nothing).
+
+    Returns the raw JSON -- with the shape (usage / percent) validated in here so bad data never
+    floats up to the UI; a wrong shape raises right away. The error wording follows the balance
+    route: HTTP status plus whatever the API says, so a bad key is instantly recognisable as
+    "HTTP 401: Unauthorized".
+    """
+    req = urllib.request.Request(GO_API, method='GET', headers={
+        'Accept': 'application/json',
+        'Authorization': 'Bearer ' + key,
+        'Cache-Control': 'no-store',
+        'User-Agent': 'dswhale_pet/1.0',
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            raw = res.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        raw = ''
+        try:
+            raw = e.read().decode('utf-8', 'replace')
+        except Exception:
+            pass
+        raise RuntimeError(http_error_text(e.code, raw))
+    except urllib.error.URLError as e:
+        raise RuntimeError('request could not be sent: %s' % e.reason)
+    except Exception as e:
+        raise RuntimeError('request timed out or the network failed: %s' % e)
+    try:
+        js = json.loads(raw)
+    except Exception:
+        raise RuntimeError('cannot make sense of the response: ' + raw[:140])
+    if not isinstance(js, dict):
+        raise RuntimeError('the response is not a JSON object: ' + raw[:140])
+    try:
+        parse_go_usage(js)
+    except ValueError as e:
+        raise RuntimeError('cannot make sense of the response: %s' % e)
     return js
 
 
@@ -658,23 +1073,28 @@ def parse_balance_text(text):
 
 
 class ApiWorker(QThread):
-    """Background thread polling the balance.
+    """Background thread polling the balance (with the OpenCode Go usage polled along the way).
 
     The main thread calls ask() and it checks once right away; otherwise it sleeps for pollSec and
-    checks again when it wakes up. Cross-thread signals are queued, so updating the UI back on the
-    main thread is safe.
+    checks again when it wakes up -- the Go leg is timed separately by goSec (both live in this one
+    thread, so its real interval can never be tighter than pollSec). Cross-thread signals are
+    queued, so updating the UI back on the main thread is safe.
     """
 
     got = pyqtSignal(dict, str)
     bad = pyqtSignal(str)
+    gotGo = pyqtSignal(dict)
+    badGo = pyqtSignal(str)
 
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.cfg = cfg
         self._wake = threading.Event()
         self._stop = False
+        self._goAt = 0.0              # when the Go usage was last fetched (time.monotonic)
 
     def ask(self):
+        self._goAt = 0.0              # manual refresh / connection test: fetch Go next beat too
         self._wake.set()
 
     def resume(self):
@@ -690,6 +1110,20 @@ class ApiWorker(QThread):
         if self.isRunning():
             self.wait(2500)
 
+    def go_due(self, t=None):
+        """Is this beat the time to "also" fetch the Go usage (only DeepSeek mode ever asks).
+
+        In Go mode the usage IS the main data and gets fetched every beat (the interval is pollSec),
+        see run(). With no goKey nothing is fetched at all -- no key, no network.
+        """
+        if not (self.cfg.get('goKey') or '').strip():
+            return False
+        return (t if t is not None else time.monotonic()) - self._goAt >= max(
+            15, int(self.cfg.get('goSec') or 60))
+
+    def go_mode(self):
+        return (self.cfg.get('mode') or 'deepseek') == 'go'
+
     def tick(self):
         key = (self.cfg.get('key') or '').strip()
         if not key:
@@ -700,9 +1134,30 @@ class ApiWorker(QThread):
         except Exception as e:
             self.bad.emit(str(e))
 
+    def tick_go(self):
+        key = (self.cfg.get('goKey') or '').strip()
+        if not key:
+            return
+        try:
+            self.gotGo.emit(fetch_go_usage(key))
+        except Exception as e:
+            self.badGo.emit(str(e))
+
     def run(self):
         while not self._stop:
-            self.tick()
+            t = time.monotonic()
+            if self.go_mode():
+                # Go mode: the usage is the main data, fetched every beat (pollSec); the DeepSeek
+                # side is never touched (two keys, two services -- cooking with Go usage means the
+                # official tokens are not used)
+                if (self.cfg.get('goKey') or '').strip():
+                    self._goAt = t
+                    self.tick_go()
+            else:
+                self.tick()
+                if self.go_due(t):
+                    self._goAt = t
+                    self.tick_go()
             self._wake.wait(max(3, int(self.cfg.get('pollSec') or 10)))
             self._wake.clear()
 
@@ -1143,10 +1598,11 @@ class PetRenderer:
     BOWL_LABEL_DY = 0.082     # where the balance sits on the bowl: this much x size below the centroid of the
                               # bowl block (bowl + rice)
 
-    def spawn_float(self, ev, bx, by, t, sym):
+    def spawn_float(self, ev, bx, by, t, sym='', unit='', dec=2):
         """A balance change -> add one floating label above the bowl rim (bx/by is the rim position
         inside the window).
 
+        The unit comes from the caller (`Core.float_style()`): money is `−¥0.03`, Go is `−1.0%`.
         Same direction and the previous one still floating (within 0.6s)? The amount is **merged
         into it**: with a 10 second poll that is fine, but in demo mode or with two samples in a
         row a stack of labels turns into a blur of digits. Merging also pulls it back to the start
@@ -1161,6 +1617,7 @@ class PetRenderer:
         # spread them out by index so they do not stack on one vertical line; no RNG, so screenshots
         # stay reproducible
         self.floats.append({'kind': kind, 'amt': float(amt), 't0': t, 'sym': sym,
+                            'unit': unit, 'dec': dec,
                             'dx': ((len(self.floats) % 3) - 1) * 0.05 * self.size})
         if len(self.floats) > 4:
             self.floats.pop(0)
@@ -1180,7 +1637,8 @@ class PetRenderer:
             a = clamp(age / 0.12, 0.0, 1.0) * clamp((1.0 - f01) / 0.45, 0.0, 1.0)
             rise = (1.0 - (1.0 - f01) ** 2) * self.FLOAT_RISE * self.size    # fast first, then slow
             spend = f['kind'] == 'spend'
-            txt = ('−' if spend else '+') + f['sym'] + fmt(f['amt'])
+            txt = ('−' if spend else '+') + f['sym'] + fmt(f['amt'], f.get('dec', 2)) \
+                + f.get('unit', '')
             fnt = pick_font(max(9, self.size * 0.078), bold=True)
             fm = QFontMetrics(fnt)
             x = bx + f['dx'] - text_w(fm, txt) / 2.0
@@ -1202,12 +1660,13 @@ class PetRenderer:
 
         Every choice follows "never cover the art": no frame, no fill, a near-black bold face over
         the white porcelain plus a very light white outline (so it stays crisp even where it lands
-        on the bowl's own linework); the currency follows the API (CNY ¥ / anything else $).
+        on the bowl's own linework); what it writes comes from the mode (`Core.lab()`): DeepSeek is
+        `¥88.50` (the currency follows the API), Go is `Left 65%`.
         It sits well below the rim, for the reasons spelled out on `BOWL_LABEL_DY` above.
         """
         if core.curBal is None:
             return
-        txt = cur_sym(core.cur) + fmt(core.curBal)
+        txt = core.lab()
         px = max(9.0, self.size * 0.095)
         fnt = pick_font(px, bold=True)
         fm = QFontMetrics(fnt)
@@ -1254,8 +1713,8 @@ class PetRenderer:
         bx, by = self.bowl_pt(st, W, H)
         k = self.scale_k()
 
-        for ev in core.take_events():                 # fresh balance changes: float one above the bowl rim
-            self.spawn_float(ev, bx, by, t, cur_sym(core.cur))
+        for ev in core.take_events():                 # fresh changes: float one above the bowl rim
+            self.spawn_float(ev, bx, by, t, **core.float_style())
         self.step_floats(t)
 
         self.fx.step(dt, bx, by, k, W)
@@ -1267,7 +1726,8 @@ class PetRenderer:
         self._ring(p, t, bx, by, k, st)
         if st == 'empty' and self.stamp_t0 is not None:
             self._stamp(p, t, rect)
-        self._toast(p, t, W, rect, st)
+        self._quota_badge(p, t, core, W, rect)      # Go mode out of quota: the "refill in HH:MM:SS" line
+        self._toast(p, t, W, rect, st)              # the toast is drawn last: it covers the badge and stays readable
         return W, H
 
     # ---------- shadow + ground glow ----------
@@ -1413,6 +1873,12 @@ class PetRenderer:
     TOAST_MAX_LINES = 3           # at most this many wrapped lines (more would fill the window and cover her face)
     TOAST_FONT_MIN = 9.5          # font size floor: a fixed 11 would fill the whole strip at small sizes
 
+    # ---------- the "refill countdown" badge above her head (Go mode, out of quota only) ----------
+    BADGE_LABEL = 'Refill in'     # what she says: when the quota comes back
+    BADGE_CORE = '#ff87c3'        # the glyph core: candy pink (cute, and not as scary as alarm red)
+    BADGE_GLOW = '#ff5fa8'        # the glow: a deeper pink
+    BADGE_EDGE = (40, 16, 28, 205)    # dark outline: stays readable on bright wallpapers / white desktops
+
     @staticmethod
     def _wrap(fm, text, maxw):
         """Wrap to maxw: break at spaces when there are any, otherwise character by character.
@@ -1472,6 +1938,55 @@ class PetRenderer:
         h = fm.height() * len(lines) + self.size * 0.045
         return fnt, lines, w, h
 
+    def badge_text(self, core):
+        """The whole countdown line above her head: `Refill in HH:MM:SS` (only counts as "out of
+        quota"; otherwise None)."""
+        clock = core.go_clock()
+        return (self.BADGE_LABEL + ' ' + clock) if clock else None
+
+    def _quota_badge(self, p, t, core, W, rect):
+        """Go mode out of quota: one line **`Refill in HH:MM:SS`** floats above her head (candy
+        pink, with a glow).
+
+        Just the one line -- **no fill, no capsule, no halo** (all three blur and are hard to read).
+        Readability comes from two things: a dark outline underneath the glyphs (the same trick as
+        the balance on the bowl -- readable on any wallpaper), then a pink glow drawn outside from
+        faint to strong (Qt has no text blur, so it is simply drawn a few extra times).
+        The countdown is recomputed every frame, so the seconds really tick; it lives in the strip
+        above her head (a toast covers it for a moment while it is up).
+        """
+        text = self.badge_text(core)
+        if not text:
+            return
+        edge = max(5.0, self.size * 0.03)
+        px = max(12.0, self.size * 0.070)                  # bigger than the toast: it lives there, needs one look
+        p.save()
+        while True:                                        # measure -> too wide -> shrink a step -> measure again
+            p.setFont(pick_font(px, bold=True))
+            fm = p.fontMetrics()                           # the **painter's** metrics: device DPI and font fallback
+            tw = text_w(fm, text)                          # are in there, so the measured width equals the drawn one
+            if tw <= W - edge * 2 or px <= 7.0:             # never stick out of the window (down to 7px it must fit)
+                break
+            px *= 0.9
+        cx = W / 2.0
+        cy = max(fm.height() / 2.0 + 3.0, rect.top() - fm.height() / 2.0 - self.size * 0.02)
+        box = QRectF(cx - tw / 2.0, cy - fm.height() / 2.0, tw, fm.height())
+        pulse = 0.5 + 0.5 * abs(math.sin(t * 2.2))         # breathe, so the glow is not dead-stiff
+        glow = QColor(self.BADGE_GLOW)
+        p.setPen(QColor(*self.BADGE_EDGE))                 # dark outline: stays put over a busy desktop
+        for dx, dy in ((-1.3, 0.0), (1.3, 0.0), (0.0, -1.3), (0.0, 1.3),
+                       (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)):
+            p.drawText(box.translated(dx, dy), Qt.AlignCenter, text)
+        for radius, alpha in ((1.8, 78), (0.9, 128)):      # the glow: two rings of pink, faint then strong
+            c = QColor(glow)
+            c.setAlpha(int(alpha * (0.5 + 0.5 * pulse)))
+            p.setPen(c)
+            for dx, dy in ((-radius, 0.0), (radius, 0.0), (0.0, -radius), (0.0, radius)):
+                p.drawText(box.translated(dx, dy), Qt.AlignCenter, text)
+        p.setPen(QColor(self.BADGE_CORE))                  # the glyph core: candy pink
+        p.drawText(box, Qt.AlignCenter, text)
+        p.restore()
+
     def _toast(self, p, t, W, rect, st):
         if not self.toast:
             return
@@ -1498,7 +2013,7 @@ class PetRenderer:
 
 
 # =====================================================================
-# 4) Windows: the pet itself + the info bubble
+# 4) Windows: the pet itself + the info bubble + the Go usage dialog
 # =====================================================================
 class PetWindow(QWidget):
     """A frameless, transparent, always-on-top little window.
@@ -1683,7 +2198,8 @@ class BubbleWindow(QWidget):
     display only, and must not get in the way of clicking anything else.
     """
 
-    W, H = 306, 168
+    W, H = 306, 168              # H is the "balance block" height; the Go block is extra, see want_h
+    GO_H = 64
 
     def __init__(self, app):
         super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -1692,8 +2208,21 @@ class BubbleWindow(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        self.resize(self.W, self.H)
+        self.resize(self.W, self.want_h())
         self.roll = None                                          # the rolling balance display
+
+    def go_on(self):
+        """Should the bubble carry the Go usage block: **goKey is filled** and the switch is on.
+
+        No key, no block -- nobody should see an ad asking them to fill a key.
+        """
+        cfg = self.app.cfg
+        return bool((cfg.get('goKey') or '').strip()) and bool(cfg.get('goBubble', True))
+
+    def want_h(self):
+        """How tall the bubble should be (whether the Go block counts in). PetApp._layout calls
+        this after a settings change."""
+        return self.H + (self.GO_H if self.go_on() else 0)
 
     def showEvent(self, ev):
         """Same as above: re-apply the OS click-through when shown (she must never block the mouse)."""
@@ -1721,10 +2250,18 @@ class BubbleWindow(QWidget):
         core = self.app.core
         if core.demo_on():
             return 'demo mode (fake local data)'
+        if core.go_mode():
+            # Go mode: this line is about the main feed (the usage endpoint)
+            if core.goErr:
+                return 'connection failed'
+            if core.goAt:
+                return 'connected · updated ' + ago_text(core.goAt)
+            return 'waiting for an OpenCode Go key' \
+                if not (self.app.cfg.get('goKey') or '').strip() else 'starting up…'
         if core.errMsg:
             return 'connection failed'
         if core.lastOkAt:
-            return 'connected · updated ' + ago(now_ms() - core.lastOkAt) + ' ago'
+            return 'connected · updated ' + ago_text(core.lastOkAt)
         return 'waiting for an API key' if not self.app.cfg['key'] else 'starting up…'
 
     def paintEvent(self, ev):
@@ -1765,17 +2302,16 @@ class BubbleWindow(QWidget):
         p.setPen(QColor(255, 255, 255) if self.roll is not None else QColor(138, 148, 164))
         p.setFont(fBig)
         p.drawText(QRectF(pad, 34, W * 0.56, 30), Qt.AlignLeft | Qt.AlignVCenter,
-                   core.sign() + fmt(self.roll, 2) if self.roll is not None
-                   else core.sign() + ' --.--')
+                   core.lab(self.roll))            # CNY 88.50 / Left 65%
         r = core.rate
         p.setFont(pick_font(13, True))
         p.setPen(acc)
         p.drawText(QRectF(W * 0.52, 35, W * 0.48 - pad, 16), Qt.AlignRight | Qt.AlignVCenter,
-                   fmt(r, 2 if r < 10 else 1) + ' CNY/hour')
+                   fmt(r, 2 if r < 10 else 1) + ' ' + core.rate_unit())
         p.setFont(fDim)
         p.setPen(QColor(150, 162, 178))
         p.drawText(QRectF(W * 0.52, 51, W * 0.48 - pad, 14), Qt.AlignRight | Qt.AlignVCenter,
-                   '≈ ' + fmt(r * 24, 3 if r * 24 < 10 else 1) + ' CNY/day')
+                   self._sub_line(core, r))
 
         # ---- last 15 minutes: the curve + the gauge ----
         self._spark(p, core, acc, QRectF(pad, 68, W - pad * 2, 34))
@@ -1783,29 +2319,135 @@ class BubbleWindow(QWidget):
         p.setFont(fDim)
         p.setPen(QColor(150, 162, 178))
         p.drawText(QRectF(pad, 110, W - pad * 2, 12), Qt.AlignRight | Qt.AlignVCenter,
-                   'threshold ' + fmt(core.cfg['slowMax'], 1))
+                   'threshold ' + fmt(core.thresh(), 1 if not core.go_mode() else 0)
+                   + ' ' + core.rate_unit())
         p.drawText(QRectF(pad, 124, W - pad * 2, 14), Qt.AlignLeft | Qt.AlignVCenter,
                    'fitted ' + fmt(core.slope, 2) + ' / instant ' + fmt(core.burst, 2)
                    + ' · ' + self._basis(core))
 
-        # ---- details: token estimate / time left / session mileage ----
+        # ---- details: token estimate / the three usage windows / time left / session mileage ----
         cfg = self.app.cfg
         per_min = (r / cfg['price'] * 1e6 / 60.0) if cfg['price'] > 0 else 0.0
         tok = ('%.1fk' % (per_min / 1000)) if per_min >= 1000 else ('%.0f' % per_min)
         p.drawText(QRectF(pad, 138, W - pad * 2, 14), Qt.AlignLeft | Qt.AlignVCenter,
-                   tok + ' tokens/min · ' + fmt(cfg['price'], 1) + ' CNY/million')
+                   self._go_summary(core) if core.go_mode()
+                   else tok + ' tokens/min · ' + fmt(cfg['price'], 1) + ' CNY/million')
         left = core.survive_ms()
         tail = '—' if left is None else ('∞' if left == float('inf') else hhmm(left))
         p.drawText(QRectF(pad, 138, W - pad * 2, 14), Qt.AlignRight | Qt.AlignVCenter,
                    'lasts ' + tail)
         p.setPen(QColor(120, 132, 148))
+        cost = ('%.1f%%' % core.session_cost()) if core.go_mode() else fmt(core.session_cost(), 4)
         p.drawText(QRectF(pad, 151, W - pad * 2, 13), Qt.AlignLeft | Qt.AlignVCenter,
-                   'watched ' + hhmm(now_ms() - core.t0) + ' · spent ' + fmt(core.session_cost(), 4))
-        if core.errMsg:
+                   'watched ' + hhmm(now_ms() - core.t0) + ' · spent ' + cost)
+        err = core.err_text()
+        if err:
             p.setPen(QColor(255, 150, 120))
             p.drawText(QRectF(pad, 151, W - pad * 2, 13), Qt.AlignRight | Qt.AlignVCenter,
-                       '⚠ ' + core.errMsg[:24])
+                       '⚠ ' + err[:24])
+
+        # ---- the OpenCode Go block (only when a key is filled; the height comes from want_h) ----
+        if self.go_on():
+            self._go_block(p, core, fDim, pad, float(self.H))
         p.end()
+
+    def _go_block(self, p, core, fDim, pad, top):
+        """The OpenCode Go usage: a title line + one line per window (label / bar / used % / time
+        left).
+
+        Even before any data arrives it says something -- "no key filled" and "couldn't fetch" are
+        different things and get different lines.
+        """
+        W = float(self.width())
+        p.setPen(QPen(QColor(255, 255, 255, 26), 1))
+        p.drawLine(QPointF(pad, top + 3), QPointF(W - pad, top + 3))      # separator from the block above
+        y = top + 6
+        p.setFont(fDim)
+        p.setPen(QColor(160, 172, 188))
+        p.drawText(QRectF(pad, y, W * 0.6, 13), Qt.AlignLeft | Qt.AlignVCenter,
+                   '🐟 OpenCode Go usage')
+        right = ''
+        if core.goErr:
+            right, col = '⚠ ' + core.goErr, QColor(255, 150, 120)
+        elif core.goAt:
+            right, col = ago_text(core.goAt), QColor(120, 132, 148)
+        else:
+            right, col = 'fetching…', QColor(120, 132, 148)
+        p.setPen(col)
+        p.drawText(QRectF(W * 0.45, y, W * 0.55 - pad, 13), Qt.AlignRight | Qt.AlignVCenter,
+                   right[:28])
+        y += 15
+        if not core.go:
+            p.setPen(QColor(120, 132, 148))
+            p.drawText(QRectF(pad, y, W - pad * 2, 13), Qt.AlignLeft | Qt.AlignVCenter,
+                       'nothing yet -- fill in an OpenCode Go API key in the settings' if not core.goErr
+                       else 'keeping the previous data, waiting to retry…')
+            return
+        fLab = pick_font(9.5)
+        for k in GO_WINS:
+            info = core.go.get(k)
+            if info is None:
+                continue
+            self._go_row(p, fLab, pad, y, k, info)
+            y += 13
+
+    def _go_row(self, p, fLab, pad, y, k, info):
+        """One window per line: `Rolling [■■■□□□] 35%` + a right-aligned "12d 4h left"."""
+        W = float(self.width())
+        p.setFont(fLab)
+        p.setPen(QColor(150, 162, 178))
+        p.drawText(QRectF(pad, y, 26, 13), Qt.AlignLeft | Qt.AlignVCenter, GO_LABEL.get(k, k))
+        bar = QRectF(pad + 28, y + 3.5, 84, 6)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(255, 255, 255, 26))
+        p.drawRoundedRect(bar, 3, 3)
+        col = self._go_color(info)
+        frac = clamp(info['percent'] / 100.0, 0.0, 1.0)
+        if frac > 0.0:
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(bar.left(), bar.top(),
+                                     max(bar.height(), bar.width() * frac), bar.height()), 3, 3)
+        p.setFont(fLab)
+        p.setPen(col)
+        p.drawText(QRectF(bar.right() + 6, y, 42, 13), Qt.AlignLeft | Qt.AlignVCenter,
+                   go_pct_str(info['percent']) + '%')
+        tail = go_reset_text(info)
+        if not go_ok(info):                       # an unhealthy status: carry the API's own wording
+            tail = '%s%s' % (info['status'], (' · ' + tail) if tail else '')
+        if tail:
+            p.setPen(QColor(120, 132, 148))
+            p.drawText(QRectF(0, y, W - pad, 13), Qt.AlignRight | Qt.AlignVCenter, tail)
+
+    @staticmethod
+    def _go_color(info):
+        """The usage bar colour: green -> yellow -> red (same family as the gauge); an unhealthy
+        status is always red."""
+        if not go_ok(info):
+            return QColor('#ff6b3d')
+        f = clamp(info['percent'] / 100.0, 0.0, 1.0)
+        lo, hi = GO_WIN_COLOR
+        if f <= lo:
+            return QColor('#5ee08a')
+        return QColor('#ffd479') if f <= hi else QColor('#ff6b3d')
+
+    @staticmethod
+    def _sub_line(core, r):
+        """The small line under the rate: DeepSeek is "≈ x CNY/day", Go is the rolling window's
+        reset countdown."""
+        if core.go_mode():
+            info = core.go.get('rolling')
+            left = go_reset_text(info) if info else ''
+            if not left:
+                return 'checks every %d s' % int(core.cfg['pollSec'])
+            return left if left == 'waiting for the reset' else ('reset: ' + left)
+        return '≈ ' + fmt(r * 24, 3 if r * 24 < 10 else 1) + ' CNY/day'
+
+    @staticmethod
+    def _go_summary(core):
+        """Go mode's detail line: each of the three windows' used percent (all in one look)."""
+        bits = ['%s %s%%' % (GO_LABEL[k], go_pct_str(core.go[k]['percent']))
+                for k in GO_WINS if k in core.go]
+        return ' · '.join(bits) if bits else 'usage not fetched yet'
 
     @staticmethod
     def _basis(core):
@@ -1833,9 +2475,10 @@ class BubbleWindow(QWidget):
             return
         lo = min(s[1] for s in w)
         hi = max(s[1] for s in w)
-        if hi - lo < 0.03:                            # 0.01 steps: flatten the display when it is that level
+        if hi - lo < (0.5 if core.go_mode() else 0.03):   # too flat: spread it (CNY graded at 0.01, % at 1)
             c = (hi + lo) / 2.0
-            lo, hi = c - 0.015, c + 0.015
+            lo, hi = c - (0.25 if core.go_mode() else 0.015), \
+                c + (0.25 if core.go_mode() else 0.015)
         t0 = now - core.win_ms()
         span = max(now - t0, 1)
         pts = []
@@ -1887,7 +2530,105 @@ class BubbleWindow(QWidget):
 
 
 # =====================================================================
-# 5) The settings window
+# 5) The OpenCode Go usage dialog (a read-only peek: how much of the three windows is used and
+#    when they reset)
+# =====================================================================
+class GoUsageDialog(QDialog):
+    """OpenCode Go usage.
+
+    One row per window (progress bar + "used x% (y% left) · time until reset") + a note + the raw
+    response. **Read-only**: it spends no quota and changes no settings; the data comes from
+    ApiWorker, and PetApp calls reload() when it lands, so the dialog keeps updating while open.
+    """
+
+    def __init__(self, app):
+        super().__init__(None)
+        self.app = app
+        self.setWindowTitle('OpenCode Go Usage')
+        self.setMinimumWidth(440)
+        lay = QVBoxLayout(self)
+
+        self.rows = {}
+        for k in GO_WINS:
+            row = QHBoxLayout()
+            lab = QLabel(GO_LABEL[k])
+            lab.setFixedWidth(34)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(False)
+            bar.setFixedWidth(150)
+            txt = QLabel('—')
+            txt.setMinimumWidth(200)
+            for wdg in (lab, bar, txt):
+                row.addWidget(wdg)
+            row.addStretch(1)
+            lay.addLayout(row)
+            self.rows[k] = (bar, txt)
+
+        self.note = QLabel('')
+        self.note.setWordWrap(True)
+        lay.addWidget(self.note)
+
+        lay.addWidget(QLabel('Raw response (if the shape ever changes, look at this):'))
+        self.raw = QPlainTextEdit()
+        self.raw.setReadOnly(True)
+        self.raw.setFixedHeight(104)
+        lay.addWidget(self.raw)
+
+        brow = QHBoxLayout()
+        for txt, fn, default in (('Refresh now', self.on_refresh, True),
+                                 ('Close', self.accept, False)):
+            b = QPushButton(txt)
+            b.clicked.connect(fn)
+            b.setDefault(default)
+            brow.addWidget(b)
+        brow.addStretch(1)
+        lay.addLayout(brow)
+        self.reload()
+
+    def on_refresh(self):
+        """Nudge the worker (both balance and Go usage refresh together -- one fetching thread)."""
+        self.app.refresh_go()
+        self.note.setText('request sent…')
+
+    def reload(self):
+        """Paint the usage currently sitting in Core onto the window (PetApp calls this when new
+        data lands)."""
+        core = self.app.core
+        cfg = self.app.cfg
+        if not (cfg.get('goKey') or '').strip():
+            self.note.setText('No OpenCode Go API key yet -- fill one in "Settings…" to get this '
+                              'working.')
+        elif core.goErr:
+            self.note.setText('Fetch failed: ' + core.goErr)
+        elif core.goAt:
+            self.note.setText('Updated %s ago · checks every %d s · the API only gives percentages,'
+                              ' no request counts'
+                              % (ago(now_ms() - core.goAt), int(cfg.get('goSec') or 60)))
+        else:
+            self.note.setText('fetching…')
+        for k, (bar, txt) in self.rows.items():
+            info = core.go.get(k)
+            if info is None:
+                bar.setValue(0)
+                txt.setText('—')
+                continue
+            pct = info['percent']
+            bar.setValue(int(clamp(round(pct), 0, 100)))      # over 100%: the bar just fills
+            bits = ['used %s%% (%s%% left)' % (go_pct_str(pct), go_pct_str(max(0.0, 100.0 - pct)))]
+            if not go_ok(info):
+                bits.append('status ' + info['status'])
+            left = go_reset_text(info)
+            if left:
+                bits.append(left)
+            txt.setText(' · '.join(bits))
+        self.raw.setPlainText(json.dumps(core.goRaw, ensure_ascii=False, indent=2)
+                              if core.goRaw else '(no data yet)')
+
+
+# =====================================================================
+# 6) The settings window
 # =====================================================================
 class SettingsDialog(QDialog):
     """Settings. The key only ever goes into the local config file; if the API is blocked, a chunk
@@ -1914,6 +2655,27 @@ class SettingsDialog(QDialog):
         krow.addWidget(eye)
         form.addRow('DeepSeek API Key', krow)
 
+        self.goKey = QLineEdit(cfg.get('goKey') or '')
+        self.goKey.setEchoMode(QLineEdit.Password)
+        self.goKey.setPlaceholderText('oc_sk-… (the OpenCode Go key, a second one, unrelated to the one above)')
+        goeye = QCheckBox('Show')
+        goeye.toggled.connect(lambda v: self.goKey.setEchoMode(
+            QLineEdit.Normal if v else QLineEdit.Password))
+        grow = QHBoxLayout()
+        grow.addWidget(self.goKey, 1)
+        grow.addWidget(goeye)
+        form.addRow('OpenCode Go API Key', grow)
+
+        self.mode = QComboBox()
+        for k in MODE_KEYS:
+            self.mode.addItem(MODES[k]['label'], k)
+        self.mode.setCurrentIndex(MODE_KEYS.index(app.core.mode()))
+        self.mode.setToolTip('Which data decides "how fast she eats":\n'
+                             '· DeepSeek balance: how fast the balance drops (CNY/hour), zero = out of rice;\n'
+                             '· OpenCode Go: how fast the rolling window remaining percent drops (%/hour),\n'
+                             '  spending faster than the threshold means "Eating Fast", any window at 100% = out')
+        form.addRow('Monitor', self.mode)
+
         self.poll = QSpinBox()
         self.poll.setRange(3, 600)
         self.poll.setSuffix(' s')
@@ -1939,8 +2701,26 @@ class SettingsDialog(QDialog):
         form.addRow('Poll interval', self.poll)
         form.addRow('Idle window', self.idle)
         form.addRow('Fast threshold', self.slow)
+        self.goslow = QDoubleSpinBox()
+        self.goslow.setRange(0.1, 1000.0)
+        self.goslow.setDecimals(1)
+        self.goslow.setSuffix(' %/hour')
+        self.goslow.setValue(float(num(cfg.get('goSlowMax'), CFG_DEFAULT['goSlowMax'])))
+        self.goslow.setToolTip("Only used in Go mode: when the rolling window's used percent implies "
+                               'this many % per hour, she switches to "Eating Fast" '
+                               '(in at 1.15x, out at 0.85x, so it does not flutter)')
+        form.addRow('Fast threshold (Go)', self.goslow)
         form.addRow('Unit price (only for the token estimate)', self.price)
         form.addRow('Fitting window', self.wmins)
+
+        self.goSec = QSpinBox()
+        self.goSec.setRange(15, 3600)
+        self.goSec.setSuffix(' s')
+        self.goSec.setValue(int(cfg.get('goSec') or 60))
+        self.goSec.setToolTip('How often to fetch the Go usage (the API only gives percentages, so '
+                              'checking more often is pointless; the real interval is also bounded '
+                              'by the poll interval -- both legs share one thread)')
+        form.addRow('Go usage polling', self.goSec)
 
         self.act = QComboBox()
         self.act.addItem('Instant rate (responsive: reacts the moment eating speeds up)', 'burst')
@@ -1970,10 +2750,13 @@ class SettingsDialog(QDialog):
         self.thru.setChecked(bool(cfg['clickThrough']))
         self.lens = QCheckBox('See through at the cursor (that patch goes transparent, showing the desktop)')
         self.lens.setChecked(bool(cfg['thruLens']))
+        self.gobub = QCheckBox('Show the OpenCode Go usage in the bubble (only works once a key is filled)')
+        self.gobub.setChecked(bool(cfg.get('goBubble', True)))
         form.addRow('', self.top)
         form.addRow('', self.bub)
         form.addRow('', self.thru)
         form.addRow('', self.lens)
+        form.addRow('', self.gobub)
         lay.addLayout(form)
 
         arow = QHBoxLayout()
@@ -2006,6 +2789,7 @@ class SettingsDialog(QDialog):
         brow = QHBoxLayout()
         for txt, fn, default in (('Save and start watching', self.on_save, True),
                                  ('Test connection', app.test_connection, False),
+                                 ('Test Go endpoint', app.test_go, False),
                                  ('Stop watching', app.stop_poll, False),
                                  ('Close', self.accept, False)):
             b = QPushButton(txt)
@@ -2029,6 +2813,11 @@ class SettingsDialog(QDialog):
             'bubble': bool(self.bub.isChecked()),
             'clickThrough': bool(self.thru.isChecked()),
             'thruLens': bool(self.lens.isChecked()),
+            'goKey': self.goKey.text().strip(),
+            'goSec': int(self.goSec.value()),
+            'goBubble': bool(self.gobub.isChecked()),
+            'mode': self.mode.currentData(),
+            'goSlowMax': float(self.goslow.value()),
         })
         return c
 
@@ -2142,9 +2931,13 @@ class PetApp:
         self.worker = ApiWorker(cfg)
         self.worker.got.connect(self.on_got)
         self.worker.bad.connect(self.on_bad)
+        self.worker.gotGo.connect(self.on_got_go)
+        self.worker.badGo.connect(self.on_bad_go)
         self.tray = None
         self.no_tray = no_tray
         self._dlg = None
+        self._go_dlg = None                       # the "OpenCode Go usage…" window (refreshed in place on new data)
+        self._go_menu_txt = ''                    # the "Go usage" line in the menu (only rebuilt on change)
         self._tray_menu = None
         self._save_timer = QTimer(self.win)
         self._save_timer.setSingleShot(True)
@@ -2153,6 +2946,7 @@ class PetApp:
 
     # ---------- start / stop ----------
     def start(self):
+        self._auto_mode()                         # only one key filled? switch to that feed
         self._layout()
         self._restore_pos()
         self.win.show()
@@ -2162,11 +2956,16 @@ class PetApp:
         self._click_through()                     # click-through has to reach the OS layer, see set_click_through
         if not self.no_tray and QSystemTrayIcon.isSystemTrayAvailable():
             self._make_tray()
-        if (self.cfg.get('key') or '').strip() and not self.core.demo_on():
+        if self.primary_key() and not self.core.demo_on():
             self.worker.resume()
 
+    def primary_key(self):
+        """The current mode's key: Go mode needs goKey, DeepSeek mode needs key."""
+        return ((self.cfg.get('goKey') or '') if self.core.go_mode()
+                else (self.cfg.get('key') or '')).strip()
+
     def start_poll(self):
-        if not (self.cfg.get('key') or '').strip():
+        if not self.primary_key():
             return
         if self.core.demo_on():                   # real data wanted: leave the demo first
             self.core.demo_start('off', now_ms())
@@ -2175,11 +2974,48 @@ class PetApp:
     def stop_poll(self):
         self.worker.stop()
 
+    def set_mode(self, name, auto=False):
+        """Switch which feed decides "how fast she eats" (from the tray menu or the settings).
+
+        The two sides have different units (CNY / %), so switching clears the samples and starts
+        over -- keeping the old ones would make the first beat read as "a huge drop at once".
+        """
+        name = name if name in MODES else 'deepseek'
+        if name == self.core.mode():
+            return False
+        self.cfg['mode'] = name
+        self.stop_poll()                          # different data source: stop the old polling first
+        self.core.reset(now_ms(), None)
+        self.rend.set_toast(('🔀 Auto-switched to ' if auto else '🔀 Switched to ')
+                            + MODES[name]['label'], 2800, self.win.t)
+        self.save_cfg()
+        self.refresh_tray_menu()
+        self.worker.cfg = self.cfg
+        self.start_poll()
+        return True
+
+    def _auto_mode(self):
+        """Only one side has a key filled? Switch to that side automatically.
+
+        Both filled / neither filled: leave it alone -- that case follows the config, it does not
+        make choices for the user. (Exactly the moment "I just filled in a Go key and nothing
+        happened at startup".)
+        """
+        has_ds = bool((self.cfg.get('key') or '').strip())
+        has_go = bool((self.cfg.get('goKey') or '').strip())
+        if has_ds == has_go:
+            return None
+        want = 'go' if has_go else 'deepseek'
+        if want == self.core.mode():
+            return None
+        self.set_mode(want, auto=True)
+        return want
+
     # ---------- layout ----------
     def _layout(self):
         W, H = self.rend.stage()
         self.win.resize(W, H)
-        self.bubble.resize(BubbleWindow.W, BubbleWindow.H)
+        self.bubble.resize(BubbleWindow.W, self.bubble.want_h())
         self._place()
         self._place_bubble()
 
@@ -2248,8 +3084,7 @@ class PetApp:
             self.bubble.update()
         if self.tray and int(self.win.t * 2) % 2 == 0:
             self.tray.setToolTip('Big Fat Fish Eats Rice · ' + STATES[core.state]['label']
-                                 + ('' if core.curBal is None else
-                                    '  ' + core.sign() + fmt(core.curBal, 2)))
+                                 + core.tip_val() + ('' if core.go_mode() else core.go_tip()))
 
     def render(self, p, t):
         self.rend.draw(p, t, self.core, self.last_dt)
@@ -2276,6 +3111,58 @@ class PetApp:
         if self.core.demo_on():                   # demo mode reports its own connection state
             return
         self.core.set_error(msg)
+
+    # ---------- OpenCode Go usage ----------
+    def on_got_go(self, js):
+        """One Go usage response arrived.
+
+        * Go mode: it is the **main data** -- handed to Core.add_go_usage (sampling / rate / the
+          four states all come out of it);
+        * DeepSeek mode: only shown alongside, does not touch the four states (two separate books,
+          each keeps its own notes).
+        """
+        if self.core.demo_on():                   # same rule as the balance: no real data in the demo
+            return
+        if self.core.go_mode():
+            try:
+                msg = self.core.add_go_usage(js, now_ms())
+            except Exception as e:
+                self.core.set_go_error(str(e))
+            else:
+                if msg:                           # a window loosened / reset: a toast + coins
+                    self.coin_burst()
+                    self.rend.set_toast(msg, 3000, self.win.t)
+            self.refresh_tray_icon()              # the state may have changed, the tray icon follows
+        else:
+            try:
+                self.core.set_go_usage(js, now_ms())
+            except Exception as e:
+                self.core.set_go_error(str(e))
+        self._go_reload()
+        self._refresh_go_menu()
+
+    def on_bad_go(self, msg):
+        if self.core.demo_on():
+            return
+        self.core.set_go_error(msg)
+        self._go_reload()
+
+    def _refresh_go_menu(self):
+        """The "Go usage" line in the menu follows the value; only rebuild the menu when it really
+        changed (do not tear it down every 60 seconds)."""
+        new = self.core.go_pct_text()
+        if new != self._go_menu_txt:
+            self._go_menu_txt = new
+            self.refresh_tray_menu()
+
+    def _go_reload(self):
+        """Refresh the Go usage dialog in place if it is open (no-op otherwise)."""
+        if self._go_dlg is None:
+            return
+        try:
+            self._go_dlg.reload()
+        except RuntimeError:                      # the window was just destroyed
+            self._go_dlg = None
 
     def coin_burst(self):
         W, H = self.rend.stage()
@@ -2333,6 +3220,8 @@ class PetApp:
             # once click-through is on she cannot be clicked, only the tray menu can undo it
             self.win.setAttribute(Qt.WA_TransparentForMouseEvents, on)
             self._click_through()
+        elif key == 'goBubble':
+            self._layout()                        # the bubble's height follows (does the Go block count in)
         self.save_cfg()
         self.refresh_tray_menu()                  # the tray menu's ticks follow along
 
@@ -2467,6 +3356,12 @@ class PetApp:
         self._act(m, 'Show / hide', lambda: self.win.setVisible(not self.win.isVisible()))
         m.addSeparator()
 
+        md = m.addMenu('Monitor (mode)')
+        g0 = QActionGroup(md)
+        for k in MODE_KEYS:
+            self._act(md, MODES[k]['label'], lambda _b, kk=k: self.set_mode(kk),
+                      check=(self.core.mode() == k), group=g0)
+
         demo = m.addMenu('Demo mode (no API key)')
         g1 = QActionGroup(demo)
         for key in ('off', 'idle', 'slow', 'fast', 'drain', 'cycle'):
@@ -2495,10 +3390,18 @@ class PetApp:
                 ('See through at the cursor', 'thruLens',
                  'with click-through on, the patch of her under the cursor goes transparent so you '
                  'can see the desktop behind it (otherwise that "invisible block" makes people '
-                 'think click-through is broken)')):
+                 'think click-through is broken)'),
+                ('Show Go usage in the bubble', 'goBubble',
+                 'only visible once an OpenCode Go key is filled: an extra block of rolling / weekly '
+                 '/ monthly bars at the bottom of the bubble')):
             self._act(m, label, lambda _b, k=key: self.toggle_flag(k),
                       check=bool(self.cfg[key]), tip=tip)
         m.addSeparator()
+        self._act(m, 'OpenCode Go usage…' + (('  (' + self._go_menu_txt + ')')
+                                             if self._go_menu_txt else ''),
+                  self.open_go, tip='reads ' + GO_API + ' (read-only, spends no quota)')
+        self._act(m, 'Refresh usage now', self.refresh_go,
+                  tip='nudge one fetch: balance and Go usage refresh together (one thread)')
         self._act(m, 'Settings…', self.open_settings)
         self._act(m, 'Clear samples', self.clear_samples)
         self._act(m, 'Start watching again', self.restart_session)
@@ -2513,13 +3416,47 @@ class PetApp:
         self._dlg = dlg
         dlg.exec_()
 
+    def open_go(self):
+        """"OpenCode Go usage…": a look at how much of the three windows is used and when they
+        reset."""
+        dlg = GoUsageDialog(self)
+        self._go_dlg = dlg
+        try:
+            dlg.exec_()
+        finally:
+            self._go_dlg = None                     # after it closes, no need to poke it on new data
+
+    def refresh_go(self):
+        """Nudge one fetch (the balance goes along -- both legs share one thread, each on its own
+        schedule)."""
+        self.worker.ask()
+
+    def test_go(self):
+        """The "Test Go endpoint" button in the settings: say it plainly without a key, otherwise
+        wake the polling."""
+        if not (self.cfg.get('goKey') or '').strip():
+            QMessageBox.information(None, 'OpenCode Go', 'No OpenCode Go API key yet.')
+            return
+        if self.core.demo_on():                   # testing a connection needs real data: leave the demo
+            self.set_demo('off')                  #   (which starts polling again on the way out)
+            return
+        self.worker.resume()
+        self.worker.ask()
+
     def about(self):
         QMessageBox.information(None, 'About · Big Fat Fish Eats Rice', (
+            'Mode: ' + MODES[self.core.mode()]['label'] + ' (switchable in the tray menu / settings)\n'
             'Balance API: ' + API + '\n'
+            'Go usage API: ' + GO_API + '\n'
             'Config file: ' + self.config_file + '\n'
             'Art: frame animations in assets/pet/anim/ (static portraits as the fallback)\n\n'
-            '· The key is only written to the local config file, only used to talk to '
-            'api.deepseek.com directly, and never sent to anyone else.\n'
+            '· Keys are only written to the local config file, only used to talk directly to '
+            'api.deepseek.com and opencode.ai, and never sent to anyone else.\n'
+            '· DeepSeek mode: the faster the balance drops, the faster she eats; balance at zero = '
+            'out of rice.\n'
+            '· OpenCode Go mode: it watches how fast the **rolling window remaining percent** drops '
+            '(= how fast the rolling value rises); spending faster than the threshold (default '
+            '20%/h) means "Eating Fast"; any of rolling / weekly / monthly at 100% = out of rice.\n'
             '· The balance API only reports three numbers (total / granted / topped up) and no token '
             'detail, so the token count is estimated from the unit price.\n'
             '· The balance only moves in 0.01 steps, so anything slower than 0.1 CNY/hour is '
@@ -2609,11 +3546,22 @@ def render_frames(outdir, size=300, seconds=3.0, fps=30.0, with_toast=True):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         prog='dswhale_pet.py',
-        description='Big Fat Fish Eats Rice -- desktop pet (four states driven by your DeepSeek burn rate)',
-        epilog='e.g. --demo=cycle cycles all four states / --slow=2 sets the "fast" threshold to 2 CNY/hour\n')
+        description='Big Fat Fish Eats Rice -- desktop pet (four states driven by your DeepSeek '
+                    'burn rate; fill in an OpenCode Go key for an extra usage block)',
+        epilog='e.g. --demo=cycle cycles all four states / --slow=2 sets the "fast" threshold to 2 '
+               'CNY/hour /\n     --go-usage --go-key oc_sk-… one-shot Go usage check, then exit\n')
     ap.add_argument('--key', help='DeepSeek API key (normally: right-click -> Settings)')
+    ap.add_argument('--mode', choices=list(MODE_KEYS),
+                    help='which feed to watch: deepseek (balance, CNY/h) / go (OpenCode Go usage, %%/h)')
+    ap.add_argument('--go-slow', type=float, help='Go-mode "fast eating" threshold, %%/hour (default 20)')
+    ap.add_argument('--go-key',
+                    help='OpenCode Go API key (a second key, read-only usage; usually in the settings)')
+    ap.add_argument('--go-sec', type=float, help='Go usage polling interval, seconds (default 60, min 15)')
+    ap.add_argument('--go-usage', action='store_true',
+                    help='print the OpenCode Go usage to the terminal and exit (no window, no Qt)')
+    ap.add_argument('--go-json', action='store_true', help='with --go-usage: also print the raw JSON')
     ap.add_argument('--demo', choices=list(DEMOS), help='demo mode (no API key needed)')
-    ap.add_argument('--bal', type=float, help='starting balance for demo mode')
+    ap.add_argument('--bal', type=float, help='demo starting value (DeepSeek in CNY, Go in remaining %%)')
     ap.add_argument('--slow', type=float, help='the "fast" threshold, CNY/hour')
     ap.add_argument('--poll', type=float, help='poll interval, seconds')
     ap.add_argument('--win', type=float, help='fitting window, minutes')
@@ -2639,8 +3587,81 @@ def apply_app_icon(qapp):
         qapp.setWindowIcon(QIcon(ICON_PATH))
 
 
+def cfg_from_args(cfg, args):
+    """Hang the command-line arguments over the config (every path except --shots builds its
+    config through this first)."""
+    if args.key is not None:
+        cfg['key'] = args.key.strip()
+    if args.mode:
+        cfg['mode'] = args.mode
+    if args.go_slow is not None:
+        cfg['goSlowMax'] = float(args.go_slow)
+    if args.go_key is not None:
+        cfg['goKey'] = args.go_key.strip()
+    if args.go_sec is not None:
+        cfg['goSec'] = int(clamp(args.go_sec, 15, 3600))
+    if args.slow is not None:
+        cfg['slowMax'] = float(args.slow)
+    if args.poll is not None:
+        cfg['pollSec'] = int(args.poll)
+    if args.win is not None:
+        cfg['windowMin'] = int(args.win)
+    if args.price is not None:
+        cfg['price'] = float(args.price)
+    if args.act:
+        cfg['actOn'] = args.act
+    if args.size is not None:
+        cfg['size'] = int(clamp(args.size, 96, 640))
+    if args.pos:
+        try:
+            x, y = [int(v) for v in args.pos.replace(' ', '').split(',')]
+            cfg['x'], cfg['y'] = x, y
+        except Exception:
+            print('[warn] --pos must look like x,y')
+    return cfg
+
+
+def print_go_usage(cfg, as_json=False, out=print):
+    """--go-usage: fetch the Go usage once and print it, return the exit code
+    (0 = ok / 2 = no key / 1 = fetch failed).
+
+    Plain text, no window -- one command that validates the key / endpoint / network without
+    touching Qt or waiting for a window to start.
+    """
+    key = (cfg.get('goKey') or '').strip()
+    if not key:
+        out('No OpenCode Go API key yet: pass one with --go-key, or fill it in the settings first.')
+        return 2
+    try:
+        js = fetch_go_usage(key)
+    except Exception as e:
+        out('Fetch failed: %s' % e)
+        return 1
+    usage, now = parse_go_usage(js), now_ms()
+    for k in GO_WINS:
+        info = usage.get(k)
+        if info is None:
+            out('%-6s -- (the API does not report this window)' % GO_LABEL[k])
+            continue
+        bits = ['used %s%%' % go_pct_str(info['percent']),
+                '%s%% left' % go_pct_str(max(0.0, 100.0 - info['percent']))]
+        if not go_ok(info):
+            bits.append('status ' + info['status'])
+        left = go_reset_text(info, now)
+        if left:
+            bits.append(left)
+        out('%-6s %s' % (GO_LABEL[k], ' · '.join(bits)))
+    if as_json:
+        out(json.dumps(js, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv=None):
     args = parse_args(argv)
+    cfg = cfg_from_args(load_config(args.config), args)   # config first: the --go-usage path never needs Qt
+
+    if args.go_usage:                            # usage only: plain text, no window
+        return print_go_usage(cfg, as_json=args.go_json)
 
     if args.shots:                                # images only, no window
         os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -2661,28 +3682,6 @@ def main(argv=None):
     qapp.setQuitOnLastWindowClosed(False)         # closing the bubble must not quit
     apply_app_icon(qapp)
     ensure_fonts()
-
-    cfg = load_config(args.config)
-    if args.key is not None:
-        cfg['key'] = args.key.strip()
-    if args.slow is not None:
-        cfg['slowMax'] = float(args.slow)
-    if args.poll is not None:
-        cfg['pollSec'] = int(args.poll)
-    if args.win is not None:
-        cfg['windowMin'] = int(args.win)
-    if args.price is not None:
-        cfg['price'] = float(args.price)
-    if args.act:
-        cfg['actOn'] = args.act
-    if args.size is not None:
-        cfg['size'] = int(clamp(args.size, 96, 640))
-    if args.pos:
-        try:
-            x, y = [int(v) for v in args.pos.replace(' ', '').split(',')]
-            cfg['x'], cfg['y'] = x, y
-        except Exception:
-            print('[warn] --pos must look like x,y')
 
     pet = PetApp(qapp, cfg, args.config, args.no_tray)
     pet.pending_bal = args.bal
