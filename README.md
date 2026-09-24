@@ -7,10 +7,9 @@ A desktop pet that polls the DeepSeek balance API and switches between four stat
 she sits on your desktop eating rice, and you get a right-click menu, drag-to-move and a status
 bubble. All four states are **frame-by-frame animations**.
 
-![Ready to Eat](preview_pet/ready.gif)
-![Eating](preview_pet/eating.gif)
-![Eating Fast](preview_pet/fast.gif)
-![Out of Rice](preview_pet/empty.gif)
+| 🍚 Ready to Eat | 🥄 Eating | 🔥 Eating Fast | 💸 Out of Rice |
+| --- | --- | --- | --- |
+| ![Ready to Eat](preview_pet/ready.gif) | ![Eating](preview_pet/eating.gif) | ![Eating Fast](preview_pet/fast.gif) | ![Out of Rice](preview_pet/empty.gif) |
 
 | State | When it shows up |
 | --- | --- |
