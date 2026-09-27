@@ -50,6 +50,19 @@ Right-click her (or the tray icon) → **Settings…** → paste your DeepSeek A
 monitoring. No key at hand? Pick a **demo mode** first (`--demo cycle` works too) and all four
 states plus their animations are right there.
 
+### Live upload / download speed above her head
+
+Right-click → **Show net speed (upload / download)** (or tick it in Settings) and a tiny one-line
+readout appears above her head: `↓ 1.2M ↑ 35K` — **text only, no box, no shadow**. ↓ download is
+**blue**, ↑ upload is **green**; both are the *whole machine's* current speeds, refreshed roughly
+twice a second. Dragging her around does not affect it.
+
+* Data comes from the OS's own NIC counters (`GetIfTable2`, 64-bit; older systems fall back to
+  `GetIfTable`, 32-bit with wraparound handled). Pure ctypes, zero extra dependencies.
+* While the toggle is off **no NIC counter is read at all** — it never sniffs traffic and nothing
+  is ever uploaded. It only reads counters; nothing leaves the machine.
+* Compact units: `350B` / `12K` / `1.2M` / `3.5G` (per second).
+
 Using OpenCode Go instead? Fill the **OpenCode Go API key** in Settings (or pass `--go-key`) and the
 bubble grows a read-only usage block (one bar per window). `--mode go` forces the feed and
 `--go-usage --go-key …` prints the usage once on the terminal and exits without opening a window.

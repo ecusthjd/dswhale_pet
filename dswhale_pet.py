@@ -39,10 +39,12 @@ Command line arguments are in parse_args below; the README has the algorithm and
 Depends on PyQt5 only: both endpoints (balance / Go usage) go through urllib, and the portraits are
 pre-made transparent PNGs, so there is no requests / Pillow. Rate measuring and the four-state logic
 live in Core, which **contains no Qt at all** and can be run on its own.
+The live net-speed monitor reads the Windows NIC counters over iphlpapi (ctypes, zero deps) -- see 2.5.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
 import datetime
 import json
 import math
@@ -122,6 +124,9 @@ CFG_DEFAULT = {
     # the pet's own settings: portrait long edge in px, always on top, bubble, click-through,
     # see-through under the cursor while click-through is on, last position
     'size': 300, 'topmost': True, 'bubble': True, 'clickThrough': False, 'thruLens': True,
+    # live net-speed monitor: one tiny line above her head showing the machine's live upload /
+    # download speed (the OS counters are only read while this toggle is on)
+    'netStatus': False,
     'x': None, 'y': None,
 }
 
@@ -1072,6 +1077,287 @@ def parse_balance_text(text):
     return js
 
 
+# =====================================================================
+# 2.5) Machine-wide live network usage (upload / download speed)
+# =====================================================================
+# Windows is read through iphlpapi's GetIfTable2: every NIC carries cumulative byte counters
+# (64-bit, so wraparound is practically a non-concern), and the speed is the difference between
+# two reads divided by the interval. Older systems fall back to GetIfTable (32-bit, wraps every
+# 4 GB -- handled). Pure ctypes, no psutil / Pdh / wmic -- the offline checks and the packaged
+# exe pick up no extra dependency.
+MAX_INTERFACE_NAME_LEN = 256
+MAXLEN_PHYSADDR = 8
+MAXLEN_IFDESCR = 256
+# GetIfTable's MIB_IFROW.dwOperStatus uses the old enum (same numbers as the netioapi one, but
+# different meanings): 5 = OPERATIONAL (connected). 1 is UNREACHABLE in the old enum, not "up".
+MIB_IF_OPER_STATUS_OPERATIONAL = 5
+
+
+class MIB_IFROW(ctypes.Structure):
+    """One GetIfTable row (the SDK's _MIB_IFROW; the field order must not be wrong)."""
+    _fields_ = [
+        ('wszName', ctypes.c_wchar * MAX_INTERFACE_NAME_LEN),
+        ('dwIndex', ctypes.c_ulong),
+        ('dwType', ctypes.c_ulong),
+        ('dwMtu', ctypes.c_ulong),
+        ('dwSpeed', ctypes.c_ulong),
+        ('dwPhysAddrLen', ctypes.c_ulong),
+        ('bPhysAddr', ctypes.c_ubyte * MAXLEN_PHYSADDR),
+        ('dwAdminStatus', ctypes.c_ulong),
+        ('dwOperStatus', ctypes.c_ulong),
+        ('dwLastChange', ctypes.c_ulong),
+        ('dwInOctets', ctypes.c_ulong),
+        ('dwInUcastPkts', ctypes.c_ulong),
+        ('dwInNUcastPkts', ctypes.c_ulong),
+        ('dwInDiscards', ctypes.c_ulong),
+        ('dwInErrors', ctypes.c_ulong),
+        ('dwInUnknownProtos', ctypes.c_ulong),
+        ('dwOutOctets', ctypes.c_ulong),
+        ('dwOutUcastPkts', ctypes.c_ulong),
+        ('dwOutNUcastPkts', ctypes.c_ulong),
+        ('dwOutDiscards', ctypes.c_ulong),
+        ('dwOutErrors', ctypes.c_ulong),
+        ('dwOutQLen', ctypes.c_ulong),
+        ('dwDescrLen', ctypes.c_ulong),
+        ('bDescr', ctypes.c_ubyte * MAXLEN_IFDESCR),
+    ]
+
+
+def if_table_octets():
+    """Cumulative received / sent bytes over every connected NIC: (recv, sent).
+
+    The speed is the difference between two reads; if it cannot be fetched it raises -- NetSpeed
+    turns that into one small line.
+    """
+    ip = ctypes.WinDLL('iphlpapi')
+    get = ip.GetIfTable
+    get.restype = ctypes.c_ulong
+    get.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_int)
+    need = ctypes.c_ulong(0)
+    if get(None, ctypes.byref(need), 0) != 122:            # ERROR_INSUFFICIENT_BUFFER
+        raise RuntimeError('cannot read NIC counters (GetIfTable probe failed)')
+    buf = ctypes.create_string_buffer(need.value)
+    if get(ctypes.byref(buf), ctypes.byref(need), 0) != 0:
+        raise RuntimeError('cannot read NIC counters (GetIfTable read failed)')
+    raw = buf.raw
+    num = int.from_bytes(raw[:4], 'little')
+    row = ctypes.sizeof(MIB_IFROW)
+    in_off = MIB_IFROW.dwInOctets.offset
+    out_off = MIB_IFROW.dwOutOctets.offset
+    oper_off = MIB_IFROW.dwOperStatus.offset
+    recv = sent = n = 0
+    for i in range(num):
+        base = 4 + i * row
+        oper = int.from_bytes(raw[base + oper_off:base + oper_off + 4], 'little')
+        # GetIfTable uses the old enum: 5 = OPERATIONAL (connected). Comparing against the new
+        # enum's 1 (UP) would skip every interface -- that is how "no NIC" used to show up.
+        if oper != MIB_IF_OPER_STATUS_OPERATIONAL:
+            continue
+        recv += int.from_bytes(raw[base + in_off:base + in_off + 4], 'little')
+        sent += int.from_bytes(raw[base + out_off:base + out_off + 4], 'little')
+        n += 1
+    if n == 0:
+        raise RuntimeError('no connected network adapter')
+    return recv, sent
+
+
+# ---- GetIfTable2 (64-bit counters, Vista+; the primary source) ----
+IF_MAX_STRING_SIZE = 256
+IF_MAX_PHYS_ADDRESS_LENGTH = 32
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [('a', ctypes.c_ulong), ('b', ctypes.c_ushort),
+                ('c', ctypes.c_ushort), ('d', ctypes.c_ubyte * 8)]
+
+
+class MIB_IF_ROW2(ctypes.Structure):
+    """One GetIfTable2 row (netioapi.h's _MIB_IF_ROW2; the field order must not be wrong)."""
+
+    _fields_ = [
+        ('InterfaceLuid', ctypes.c_uint64),
+        ('InterfaceIndex', ctypes.c_ulong),
+        ('InterfaceGuid', _GUID),
+        ('Alias', ctypes.c_wchar * (IF_MAX_STRING_SIZE + 1)),
+        ('Description', ctypes.c_wchar * (IF_MAX_STRING_SIZE + 1)),
+        ('PhysicalAddressLength', ctypes.c_ulong),
+        ('PhysicalAddress', ctypes.c_ubyte * IF_MAX_PHYS_ADDRESS_LENGTH),
+        ('PermanentPhysicalAddress', ctypes.c_ubyte * IF_MAX_PHYS_ADDRESS_LENGTH),
+        ('Mtu', ctypes.c_ulong),
+        ('Type', ctypes.c_int),
+        ('TunnelType', ctypes.c_int),
+        ('MediaType', ctypes.c_int),
+        ('PhysicalMediumType', ctypes.c_int),
+        ('AccessType', ctypes.c_int),
+        ('DirectionType', ctypes.c_int),
+        ('Flags', ctypes.c_ubyte),
+        ('OperStatus', ctypes.c_int),
+        ('AdminStatus', ctypes.c_int),
+        ('MediaConnectState', ctypes.c_int),
+        ('NetworkGuid', _GUID),
+        ('ConnectionType', ctypes.c_int),
+        ('TransmitLinkSpeed', ctypes.c_uint64),
+        ('ReceiveLinkSpeed', ctypes.c_uint64),
+        ('InOctets', ctypes.c_uint64),
+        ('InUcastPkts', ctypes.c_uint64),
+        ('InNUcastPkts', ctypes.c_uint64),
+        ('InDiscards', ctypes.c_uint64),
+        ('InErrors', ctypes.c_uint64),
+        ('InUnknownProtos', ctypes.c_uint64),
+        ('InUcastOctets', ctypes.c_uint64),
+        ('InMulticastOctets', ctypes.c_uint64),
+        ('InBroadcastOctets', ctypes.c_uint64),
+        ('OutOctets', ctypes.c_uint64),
+        ('OutUcastPkts', ctypes.c_uint64),
+        ('OutNUcastPkts', ctypes.c_uint64),
+        ('OutDiscards', ctypes.c_uint64),
+        ('OutErrors', ctypes.c_uint64),
+        ('OutUcastOctets', ctypes.c_uint64),
+        ('OutMulticastOctets', ctypes.c_uint64),
+        ('OutBroadcastOctets', ctypes.c_uint64),
+        ('OutQLen', ctypes.c_uint64),
+    ]
+
+
+def if_table2_octets():
+    """GetIfTable2: cumulative received / sent bytes over every connected NIC ((recv, sent), 64-bit).
+
+    There is 4 bytes of alignment padding between NumEntries(4B) and Table[0] (the netioapi docs
+    say so), so the first row starts at offset 8. OperStatus is IF_OPER_STATUS in the docs but
+    measures as NET_IF_OPER_STATUS in practice (1 = UP); accept both enums' "connected" values
+    (1 / 5), skip 2 (down) / 6 (not present) and friends.
+    """
+    ip = ctypes.WinDLL('iphlpapi')
+    g2 = ip.GetIfTable2
+    g2.restype = ctypes.c_ulong
+    g2.argtypes = (ctypes.POINTER(ctypes.c_void_p),)
+    free = ip.FreeMibTable
+    free.argtypes = (ctypes.c_void_p,)
+    pp = ctypes.c_void_p(0)
+    if g2(ctypes.byref(pp)) != 0:
+        raise RuntimeError('cannot read NIC counters (GetIfTable2 failed)')
+    try:
+        head = ctypes.string_at(pp.value, 8)
+        num = int.from_bytes(head[:4], 'little')
+        row = ctypes.sizeof(MIB_IF_ROW2)
+        raw = ctypes.string_at(pp.value, 4 + num * row + 16)   # a little slack, do not read past the end
+    finally:
+        free(ctypes.c_void_p(pp.value))
+    first = 8                                            # Table[0] starts after the alignment padding
+    in_off = MIB_IF_ROW2.InOctets.offset
+    out_off = MIB_IF_ROW2.OutOctets.offset
+    oper_off = MIB_IF_ROW2.OperStatus.offset
+    recv = sent = n = 0
+    for i in range(num):
+        base = first + i * row
+        oper = int.from_bytes(raw[base + oper_off:base + oper_off + 4], 'little')
+        if oper not in (1, 5):                           # 1 = NET_IF_OPER_STATUS_UP / 5 = old-enum OPERATIONAL
+            continue
+        recv += int.from_bytes(raw[base + in_off:base + in_off + 8], 'little')
+        sent += int.from_bytes(raw[base + out_off:base + out_off + 8], 'little')
+        n += 1
+    if n == 0:
+        raise RuntimeError('no connected network adapter')
+    return recv, sent
+
+
+_IF_T2_OK = {'v': None}   # None = not tried / True = use the 64-bit table / False = fall back to the 32-bit one
+
+
+def current_octets():
+    """The 64-bit table (GetIfTable2) first; fall back to the old 32-bit table (GetIfTable)."""
+    if _IF_T2_OK['v'] is not False:
+        try:
+            recv, sent = if_table2_octets()
+        except Exception:
+            _IF_T2_OK['v'] = False                      # missing / unusable: use the old table from now on
+        else:
+            _IF_T2_OK['v'] = True
+            return recv, sent
+    return if_table_octets()
+
+
+class NetSpeed:
+    """Samples the NIC counters on a MIN_DT interval to get the machine's live download/upload (B/s).
+
+    A sample is "this read minus the previous read"; with too-short an interval the difference is
+    basically zero, so there is a minimum interval -- before it is due it does **not even touch the
+    OS** (the renderer calls sample() every frame at 30 fps; do not actually read the table that
+    often). The numbers go through a first-order EMA (SMOOTH) or the display is an ECG.
+    """
+
+    MIN_DT = 0.5            # at least this long between two samples (0.5 s, plus the 0.4 EMA: responsive)
+    SMOOTH = 0.40           # EMA factor: bigger = more responsive
+    UINT32 = 1 << 32
+
+    def __init__(self):
+        self.down = 0.0     # download B/s (recv)
+        self.up = 0.0       # upload B/s (sent)
+        self.err = ''       # why the counters could not be read (shown instead of the numbers)
+        self._prev = None
+        self._last_at = None
+        self._primed = False
+
+    @staticmethod
+    def _delta(cur, old):
+        if cur >= old:
+            return cur - old
+        return (NetSpeed.UINT32 - old) + cur            # 32-bit counter wraparound (never hit on the 64-bit table)
+
+    def sample(self):
+        t = time.monotonic()
+        if self._last_at is not None and t - self._last_at < self.MIN_DT:
+            return                                      # not due yet: do not even touch the OS
+        self._last_at = t
+        try:
+            recv, sent = current_octets()
+        except Exception as e:
+            self.err = str(e)
+            return
+        prev = self._prev
+        self._prev = (recv, sent, t)
+        if prev is None or t - prev[2] < self.MIN_DT:
+            return
+        dt = t - prev[2]
+        raw_down = self._delta(recv, prev[0]) / dt
+        raw_up = self._delta(sent, prev[1]) / dt
+        if self._primed:
+            a = self.SMOOTH
+            self.down = self.down * (1 - a) + raw_down * a
+            self.up = self.up * (1 - a) + raw_up * a
+        else:
+            self.down, self.up = raw_down, raw_up
+            self._primed = True
+
+
+def net_speed_text(bps):
+    """Bytes/second -> one line: `0 B/s` / `35 KB/s` / `1.2 MB/s` ('—' when unavailable)."""
+    if bps is None or bps < 0:
+        return '—'
+    if bps < 1024:
+        return '%.0f B/s' % bps
+    if bps < 1048576:
+        return '%.1f KB/s' % (bps / 1024.0)
+    if bps < 1073741824:
+        return '%.2f MB/s' % (bps / 1048576.0)
+    return '%.2f GB/s' % (bps / 1073741824.0)
+
+
+def net_speed_short(bps):
+    """Bytes/second -> the tiny line's compact form: `3B` / `12K` / `1.2M` (per second, unit dropped)."""
+    if bps is None or bps < 0:
+        return '--'
+    if bps < 1024:
+        return '%.0fB' % bps
+    if bps < 1048576:
+        v = bps / 1024.0
+        return ('%.1fK' % v) if v < 100 else ('%.0fK' % v)
+    if bps < 1073741824:
+        v = bps / 1048576.0
+        return ('%.1fM' % v) if v < 100 else ('%.0fM' % v)
+    return '%.1fG' % (bps / 1073741824.0)
+
+
 class ApiWorker(QThread):
     """Background thread polling the balance (with the OpenCode Go usage polled along the way).
 
@@ -1526,6 +1812,7 @@ class PetRenderer:
     def __init__(self, art, cfg):
         self.art = art
         self.cfg = cfg
+        self.nets = None                # net-speed provider: PetApp hands `() -> (down, up, err) | None`
         self.fx = FX()
         self.size = int(cfg.get('size') or 300)
         self.fade_from = None
@@ -1724,11 +2011,53 @@ class PetRenderer:
         self._balance(p, t, core, bx, by, st, k)     # the balance written on the bowl
         self._floats(p, t, bx, by)                   # just spent / just topped up, drifting up
         self._ring(p, t, bx, by, k, st)
+        self._net_line(p, t, core, rect, k)             # the tiny live net-speed line above her head (toggle only)
         if st == 'empty' and self.stamp_t0 is not None:
             self._stamp(p, t, rect)
         self._quota_badge(p, t, core, W, rect)      # Go mode out of quota: the "refill in HH:MM:SS" line
         self._toast(p, t, W, rect, st)              # the toast is drawn last: it covers the badge and stays readable
         return W, H
+
+    # ---------- the tiny live net-speed line above her head (text only, no box, no shadow) ----------
+    def _net_line(self, p, t, core, rect, k):
+        if not self.nets:
+            return
+        v = self.nets()
+        if not v:
+            return
+        down, up, err = v
+        if err:
+            segs = [('net reading failed', QColor(255, 255, 255, 235))]
+        else:
+            # colour tells the direction at a glance: ↓ download is blue (pulling data in),
+            # ↑ upload is green (pushing requests out)
+            segs = [('↓' + net_speed_short(down), QColor('#4db8ff')),
+                    ('↑' + net_speed_short(up), QColor('#5ee08a'))]
+        fnt = pick_font(max(9.0, self.size * 0.052), bold=True)
+        fm = QFontMetrics(fnt)
+        y = rect.top() - self.size * 0.055              # default slot: a little above her head
+        if self.badge_text(core):
+            # Go out of quota: the "Refill in HH:MM:SS" badge sits up there too -- this line still shows,
+            # just moved to **above the badge**, with a wider gap than usual (0.028 * size).
+            # Measure the badge's top with the same method _quota_badge uses, do not guess pixels.
+            b_fm = QFontMetrics(pick_font(max(12.0, self.size * 0.070), bold=True))
+            b_top = max(3.0, rect.top() - b_fm.height() - self.size * 0.02)
+            y = b_top - fm.descent() - max(4.0, self.size * 0.028)
+            if y - fm.ascent() < 2.0:                   # genuinely no room above: skip it, never overlap
+                return
+        elif y < 2.0:
+            y = 2.0
+        gap = max(3.0, self.size * 0.015)
+        w_net = sum(text_w(fm, s) for s, _ in segs) + gap * (len(segs) - 1)
+        x = rect.center().x() - w_net / 2.0
+        p.save()
+        p.setFont(fnt)
+        for s, col in segs:
+            w = text_w(fm, s)
+            p.setPen(col)                                # one plain stroke: no shadow, no box
+            p.drawText(QPointF(x, y), s)
+            x += w + gap
+        p.restore()
 
     # ---------- shadow + ground glow ----------
     def _ground(self, p, rect, acc, st, t):
@@ -2752,11 +3081,17 @@ class SettingsDialog(QDialog):
         self.lens.setChecked(bool(cfg['thruLens']))
         self.gobub = QCheckBox('Show the OpenCode Go usage in the bubble (only works once a key is filled)')
         self.gobub.setChecked(bool(cfg.get('goBubble', True)))
+        self.netst = QCheckBox('Show live net speed above her head (machine upload / download)')
+        self.netst.setChecked(bool(cfg.get('netStatus', False)))
+        self.netst.setToolTip('One tiny line above her head, text only (no box, no shadow): '
+                              '↓ download ↑ upload. Reads the local Windows NIC counters; '
+                              'uploads nothing.')
         form.addRow('', self.top)
         form.addRow('', self.bub)
         form.addRow('', self.thru)
         form.addRow('', self.lens)
         form.addRow('', self.gobub)
+        form.addRow('', self.netst)
         lay.addLayout(form)
 
         arow = QHBoxLayout()
@@ -2816,6 +3151,7 @@ class SettingsDialog(QDialog):
             'goKey': self.goKey.text().strip(),
             'goSec': int(self.goSec.value()),
             'goBubble': bool(self.gobub.isChecked()),
+            'netStatus': bool(self.netst.isChecked()),
             'mode': self.mode.currentData(),
             'goSlowMax': float(self.goslow.value()),
         })
@@ -2925,6 +3261,8 @@ class PetApp:
         self.rend = PetRenderer(self.art, cfg)
         self.win = PetWindow(self)
         self.bubble = BubbleWindow(self)
+        self.netspeed = NetSpeed()                 # machine-wide net speed (counters read only while the toggle is on)
+        self.rend.nets = self._net_info            # feeds the tiny line above her head every frame
         self.demo_acc = 0.0
         self.pending_bal = None
         self.last_dt = 0.016
@@ -3082,6 +3420,11 @@ class PetApp:
             # step_roll() alone would never show up. This pushes one repaint per frame, which is what
             # keeps lines like "connected · updated 3s ago" and "watched 0h 12m" counting up live.
             self.bubble.update()
+        if self.cfg.get('netStatus'):
+            # Net speed sampling: while the toggle is off no NIC counter is read at all -- it never
+            # sits around snooping on traffic. NetSpeed throttles internally (one sample per 0.5 s);
+            # the renderer reads the latest values and paints the line above her head every frame.
+            self.netspeed.sample()
         if self.tray and int(self.win.t * 2) % 2 == 0:
             self.tray.setToolTip('Big Fat Fish Eats Rice · ' + STATES[core.state]['label']
                                  + core.tip_val() + ('' if core.go_mode() else core.go_tip()))
@@ -3222,6 +3565,8 @@ class PetApp:
             self._click_through()
         elif key == 'goBubble':
             self._layout()                        # the bubble's height follows (does the Go block count in)
+        elif key == 'netStatus':
+            pass                                    # only decides "sample or not + draw on the head or not", no window ops
         self.save_cfg()
         self.refresh_tray_menu()                  # the tray menu's ticks follow along
 
@@ -3278,6 +3623,12 @@ class PetApp:
 
     def save_cfg(self):
         save_config(self.cfg, self.config_file)
+
+    def _net_info(self):
+        """The renderer reads this every frame: None while the toggle is off (no line, no counter reads)."""
+        if not self.cfg.get('netStatus'):
+            return None
+        return (self.netspeed.down, self.netspeed.up, self.netspeed.err or '')
 
     def test_connection(self):
         if not (self.cfg.get('key') or '').strip():
@@ -3393,7 +3744,10 @@ class PetApp:
                  'think click-through is broken)'),
                 ('Show Go usage in the bubble', 'goBubble',
                  'only visible once an OpenCode Go key is filled: an extra block of rolling / weekly '
-                 '/ monthly bars at the bottom of the bubble')):
+                 '/ monthly bars at the bottom of the bubble'),
+                ('Show net speed (upload / download)', 'netStatus',
+                 'one tiny line above her head: ↓ download, ↑ upload, live machine-wide; reads the '
+                 'local Windows NIC counters only, uploads nothing')):
             self._act(m, label, lambda _b, k=key: self.toggle_flag(k),
                       check=bool(self.cfg[key]), tip=tip)
         m.addSeparator()
